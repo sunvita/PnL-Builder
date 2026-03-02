@@ -1672,6 +1672,50 @@ def _parse_cba_home_loan_transactions(text: str) -> list:
 
 _NAB_HL_MARKER = re.compile(r'NAB Tailored Home Loan', re.IGNORECASE)
 
+# ── Generic bank-statement detector (module-level, compiled once) ─────────────
+# Single regex covering all known home/investment/mortgage loan statement
+# formats. Checked as the FIRST routing step to prevent false positives from
+# educational text in PDFs (e.g. ANZ tips page: "the money in an offset account").
+# Covers both spelled-out ("Investment") and abbreviated ("Invest.") forms so
+# ANZ "RESIDENTIAL INVEST. LOAN STATEMENT" is caught without a separate marker.
+_BANK_STMT_RE = re.compile(
+    # Generic loan statement phrases (any lender)
+    r'home\s+loan\s+statement'
+    r'|investment\s+(?:home\s+)?loan\s+(?:statement|transactions)'
+    r'|residential\s+invest(?:ment)?\W{0,2}\s*loan\s+statement'
+    r'|tailored\s+home\s+loan'
+    r'|mortgage\s+(?:account\s+)?statement'
+    # Named lenders
+    r'|bankwest\s+(?:home\s+|variable\s+|fixed\s+)?(?:loan|mortgage)'
+    r'|macquarie\s+(?:home\s+|offset\s+)?(?:loan|mortgage)'
+    r'|resimac\s+(?:home\s+|prime\s+|premier\s+)?(?:loan|mortgage|statement)'
+    r'|firstmac\s+(?:home\s+|smart\s+)?(?:loan|mortgage)',
+    re.IGNORECASE,
+)
+
+# ── Utility bill keywords (module-level, built once) ─────────────────────────
+_UTILITY_KEYWORDS = frozenset([
+    'amount due', 'amount payable', 'kwh', 'usage charge',
+    'bill amount', 'water use', 'service charge',
+    'electricity charge', 'energy charge', 'gas charge',
+    'broadband', 'nbn service', 'data usage',
+    'total charges', 'please pay by',
+])
+
+# ── Invoice / govt-notice keywords (module-level, built once) ────────────────
+_INVOICE_KEYWORDS = frozenset([
+    # Government rates & land tax
+    'council rates', 'rates notice', 'rate notice',
+    'municipal rates', 'local government rates',
+    'government rates and charges', 'general grv',
+    'grv valuation', 'land tax assessment',
+    'notice of assessment', 'revenue nsw', 'state revenue',
+    # Strata / body corporate
+    'strata levy', 'body corporate levy',
+    'owners corporation', 'administrative fund levy',
+    'sinking fund levy', 'capital works levy',
+])
+
 _NAB_MON = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
     'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
@@ -1774,10 +1818,14 @@ def _parse_nab_home_loan_transactions(text: str) -> list:
             if amt_m and pending_interest_date:
                 repayment = abs(_parse_amount(amt_m.group(1)) or 0.0)
                 if repayment > 0:
+                    _partial = (pending_interest == 0)
                     # Full repayment = cash out of bank account (used in Net Cash Flow)
                     transactions.append({
                         'date':        pending_interest_date,
-                        'description': 'Loan Repayment',
+                        'description': (
+                            'Loan Repayment (partial period — interest in adjacent billing cycle)'
+                            if _partial else 'Loan Repayment'
+                        ),
                         'amount':      round(repayment, 2),
                         'type':        'debit',
                         'section':     'cashflow',
@@ -1789,7 +1837,10 @@ def _parse_nab_home_loan_transactions(text: str) -> list:
                     if principal > 0:
                         transactions.append({
                             'date':        pending_interest_date,
-                            'description': 'Principal Repaid',
+                            'description': (
+                                'Repayment — partial period (no interest charged this cycle)'
+                                if _partial else 'Principal Repaid'
+                            ),
                             'amount':      principal,
                             'type':        'credit',   # positive — informational capital return
                             'section':     'cashflow',
@@ -2011,6 +2062,7 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
             continue
 
         date_str = f'01/{mon:02d}/{yr}'   # representative date = 1st of month
+        _partial = (interest == 0)       # boundary month — interest in adjacent cycle
 
         if interest > 0:
             transactions.append({
@@ -2024,7 +2076,10 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
 
         transactions.append({
             'date':        date_str,
-            'description': 'Loan Payment',
+            'description': (
+                'Loan Payment (partial period — interest in adjacent billing cycle)'
+                if _partial else 'Loan Payment'
+            ),
             'amount':      repayment,
             'type':        'debit',
             'section':     'cashflow',
@@ -2036,7 +2091,10 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
         if principal > 0:
             transactions.append({
                 'date':        date_str,
-                'description': 'Principal Repaid',
+                'description': (
+                    'Repayment — partial period (no interest charged this cycle)'
+                    if _partial else 'Principal Repaid'
+                ),
                 'amount':      principal,
                 'type':        'credit',   # positive informational figure
                 'section':     'cashflow',
@@ -2794,7 +2852,14 @@ def parse_pdf(file_bytes: bytes, filename: str = '', doc_type: str = 'auto') -> 
     if doc_type == 'invoice':
         return parse_invoice(file_bytes, filename)
 
-    text = _extract_text(file_bytes).lower()
+    text_raw = _extract_text(file_bytes)
+    text = text_raw.lower()
+
+    # ── 0. Home / investment loan — single regex, checked FIRST ──────────────
+    #       Prevents misrouting when bank tips pages contain rental-like words
+    #       (e.g. ANZ offset hint: "the money in an offset account").
+    if _BANK_STMT_RE.search(text_raw):
+        return parse_bank_statement(file_bytes, filename)
 
     # ── 1. Rental / ownership statement ──────────────────────────────────────
     if any(k in text for k in ['money in', 'money out', 'ownership statement',
@@ -2802,39 +2867,20 @@ def parse_pdf(file_bytes: bytes, filename: str = '', doc_type: str = 'auto') -> 
                                 'landlord statement']):
         return parse_rental_statement(file_bytes, filename)
 
-    # ── 2. Government notices & rates ────────────────────────────────────────
-    if any(k in text for k in ['council rates', 'rates notice', 'rate notice',
-                                'municipal rates', 'local government rates',
-                                'government rates and charges', 'general grv',
-                                'grv valuation', 'land tax assessment',
-                                'notice of assessment', 'revenue nsw', 'state revenue']):
+    # ── 2. Govt rates, strata levies & trade invoices (all → parse_invoice) ──
+    if any(k in text for k in _INVOICE_KEYWORDS):
         return parse_invoice(file_bytes, filename)
-
-    # ── 3. Strata / body corporate ────────────────────────────────────────────
-    if any(k in text for k in ['strata levy', 'body corporate levy',
-                                'owners corporation', 'administrative fund levy',
-                                'sinking fund levy', 'capital works levy']):
-        return parse_invoice(file_bytes, filename)
-
-    # ── 4. Trade / service invoices ───────────────────────────────────────────
     if any(k in text for k in ['tax invoice', 'invoice no', 'invoice number',
                                 'abn:', 'australian business number']) and \
        any(k in text for k in ['total', 'amount due', 'amount payable',
                                 'balance due', 'please pay']):
         return parse_invoice(file_bytes, filename)
 
-    # ── 5. Utility bills (before bank to avoid false match on "account number") ─
-    utility_keywords = [
-        'amount due', 'amount payable', 'kwh', 'usage charge',
-        'bill amount', 'water use', 'service charge',
-        'electricity charge', 'energy charge', 'gas charge',
-        'broadband', 'nbn service', 'data usage',
-        'total charges', 'please pay by',
-    ]
-    if any(k in text for k in utility_keywords):
+    # ── 3. Utility bills ──────────────────────────────────────────────────────
+    if any(k in text for k in _UTILITY_KEYWORDS):
         return parse_utility_bill(file_bytes, filename)
 
-    # ── 6. Bank transaction statement ─────────────────────────────────────────
+    # ── 4. Generic bank statement fallback ────────────────────────────────────
     if any(k in text for k in ['account number', 'bsb', 'opening balance',
                                 'closing balance', 'available balance',
                                 'statement of account']):

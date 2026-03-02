@@ -1626,7 +1626,7 @@ elif st.session_state.step == 2:
                                 f"This file will overwrite it with identical data."
                             )
                         else:
-                            _seen_stmts[_dup_key] = f.name
+                            _seen_stmts[_dup_key] = fname
 
                     if txns:
                         # ── Summary metrics ────────────────────────────────
