@@ -655,8 +655,8 @@ FREE_PROP_LIMIT   = 1    # max properties on free plan
 FREE_MONTH_LIMIT  = 6    # max months of data on free plan
 
 def _is_pro() -> bool:
-    """True when the current session has a Pro licence."""
-    return st.session_state.get('user_plan', 'free') == 'pro'
+    """Main branch — all features unlocked (no gating)."""
+    return True
 
 def _plan_badge_html(plan: str | None = None) -> str:
     """Return an inline HTML badge chip for the given plan (or current session plan)."""
@@ -1147,17 +1147,15 @@ elif st.session_state.step == 1:
 
     col1, col2 = st.columns(2)
     with col1:
-        # Gate 1: Free plan → 1 property max
-        _prop_options = list(range(1, 11)) if _is_pro() else [1]
-        _prop_help = (
-            "Up to 10 properties. Each gets its own tab."
-            if _is_pro() else
-            "Free plan: 1 property. Upgrade to Pro for unlimited properties."
-        )
-        n_props = st.selectbox(
-            "Number of properties", _prop_options,
+        # Gate 1: Free plan → 1 property max; Pro → unlimited via number input
+        n_props = st.number_input(
+            "Number of properties",
+            min_value=1,
+            max_value=1 if not _is_pro() else None,
+            value=int(st.session_state.get('setup_n_props', 1)),
+            step=1,
             key='setup_n_props',
-            help=_prop_help
+            help="Each property gets its own tab.",
         )
         if not _is_pro():
             st.markdown(
