@@ -714,7 +714,7 @@ def _render_upgrade_banner() -> None:
             f'color:#1a1a2e;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
             f'font-size:14px;font-weight:600;display:flex;align-items:center;'
             f'justify-content:space-between;gap:12px;">'
-            f'⚡ Free plan — 1 property · 6 months data · limited features'
+            f'⚡ Free plan — 1 property · Save &amp; Load session · limited features'
             f'<a href="{STRIPE_URL}" target="_blank" style="display:inline-block;'
             f'background:#FFFFFF;color:#E65100 !important;text-decoration:none;'
             f'padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;'
@@ -723,16 +723,22 @@ def _render_upgrade_banner() -> None:
             unsafe_allow_html=True
         )
     else:
-        # ── Pro: navy strip with PRO badge ─────────────────────────────────────
+        # ── Pro: navy strip with PRO badge + feature summary ───────────────────
         st.markdown(
             f'<div style="background:#1A237E;'
             f'color:#FFFFFF;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
-            f'font-size:14px;font-weight:500;display:flex;align-items:center;'
+            f'font-size:13px;font-weight:400;display:flex;align-items:center;'
             f'justify-content:space-between;gap:12px;">'
-            f'Propfolio — All features unlocked'
+            f'<span style="opacity:0.85;">'
+            f'✅ Unlimited properties &nbsp;·&nbsp; '
+            f'✅ Full FY history &nbsp;·&nbsp; '
+            f'✅ Add Entry &nbsp;·&nbsp; '
+            f'✅ Portfolio Summary tab &nbsp;·&nbsp; '
+            f'✅ Restore from Excel'
+            f'</span>'
             f'<span style="background:linear-gradient(90deg,#FFA726 0%,#FF8F00 100%);'
             f'color:#1a1a2e;padding:4px 14px;border-radius:20px;font-size:12px;'
-            f'font-weight:800;letter-spacing:0.5px;white-space:nowrap;">PRO</span>'
+            f'font-weight:800;letter-spacing:0.5px;white-space:nowrap;flex-shrink:0;">PRO</span>'
             f'</div>',
             unsafe_allow_html=True
         )
@@ -1413,16 +1419,6 @@ elif st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.markdown('<div class="step-badge">STEP 2 of 4</div>', unsafe_allow_html=True)
     st.markdown("### Upload PDFs")
-
-    # Gate 6: 6-month data cap on Free plan
-    if not _is_pro():
-        st.markdown(
-            f'<div class="warn-box">🔒 <b>Free plan — 6 months data limit.</b> '
-            f'Only the 6 most recent months will be included in your Excel output. '
-            f'<a href="{STRIPE_URL}" target="_blank" style="color:#E65100;font-weight:700;">'
-            f'Upgrade to Pro ($49 once)</a> for full FY history.</div>',
-            unsafe_allow_html=True
-        )
 
     if st.session_state.get('session_loaded'):
         n_months = sum(len(p['data']) for p in st.session_state.properties)
@@ -2232,40 +2228,28 @@ elif st.session_state.step == 4:
                 type="primary",
             )
         with save_col:
-            # Gate 4: Save Session — Pro only
-            if _is_pro():
-                session_json = _session_to_json()
-                save_filename = (
-                    f"property_pl_session_"
-                    f"{datetime.datetime.now().strftime('%Y%m')}.json"
-                )
-                st.download_button(
-                    label="💾 Save Session (for next month)",
-                    data=session_json,
-                    file_name=save_filename,
-                    mime="application/json",
-                    use_container_width=True,
-                    help="Save all property configs + data as JSON. "
-                         "Load it next month to add new PDFs on top of existing data.",
-                )
-            else:
-                st.markdown(
-                    f'<div style="border:2px dashed #D0D0D0;border-radius:8px;padding:12px 14px;'
-                    f'text-align:center;background:#fafafa;">'
-                    f'🔒 <b style="color:#333;">Save Session</b><br>'
-                    f'<span style="font-size:12px;color:#777;">Keep your data for next month — Pro only</span><br>'
-                    f'<a href="{STRIPE_URL}" target="_blank" class="lock-cta" '
-                    f'style="margin-top:10px;display:inline-block;">Upgrade — $49 once →</a>'
-                    f'</div>', unsafe_allow_html=True
-                )
-
-        if _is_pro():
-            st.markdown(
-                '<div class="info-box">💡 <b>Next month workflow</b>: '
-                'Click "Save Session" → next month, go to Step 1 → "Load previous session" '
-                '→ upload only the new month\'s PDFs → the app handles add/update automatically.'
-                '</div>', unsafe_allow_html=True
+            # Save Session — Free & Pro
+            session_json = _session_to_json()
+            save_filename = (
+                f"property_pl_session_"
+                f"{datetime.datetime.now().strftime('%Y%m')}.json"
             )
+            st.download_button(
+                label="💾 Save Session (for next month)",
+                data=session_json,
+                file_name=save_filename,
+                mime="application/json",
+                use_container_width=True,
+                help="Save all property configs + data as JSON. "
+                     "Load it next month to add new PDFs on top of existing data.",
+            )
+
+        st.markdown(
+            '<div class="info-box">💡 <b>Next month workflow</b>: '
+            'Click "Save Session" → next month, go to Step 1 → "Load previous session" '
+            '→ upload only the new month\'s PDFs → the app handles add/update automatically.'
+            '</div>', unsafe_allow_html=True
+        )
 
         st.markdown("---")
         st.markdown("#### What's in the Excel?")
