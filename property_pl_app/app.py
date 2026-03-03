@@ -882,17 +882,23 @@ if st.session_state.get('show_landing', True):
     if os.path.exists(_landing_path):
         with open(_landing_path, 'r', encoding='utf-8') as _f:
             _landing_html = _f.read()
-        # Replace CTA hrefs — clicking navigates to ?enter=1.
-        # Uses window.top (allowed by Streamlit's allow-top-navigation-by-user-activation
-        # sandbox flag) so it works even when window.parent.location is cross-origin blocked.
-        # Streamlit detects the query param on re-run, sets show_landing=False, clears param.
-        _enter_js = (
-            "javascript:void(0)"
-            "\" onclick=\""
-            "window.top.location.href="
-            "window.top.location.pathname+'?enter=1'"
+        # Replace CTA hrefs — clicking sends a Streamlit componentValue message.
+        # window.parent.postMessage is always allowed from sandboxed iframes (no special
+        # sandbox flags needed). Streamlit receives the value, re-runs, and Python detects
+        # the "enter" signal below to set show_landing=False.
+        # NOTE: window.top.location.href was removed — it silently fails when the component
+        # iframe is served as a data:/blob: URL (cross-origin), which blocks .pathname reads.
+        _cta_onclick = (
+            "window.parent.postMessage("
+            "{isStreamlitMessage:true,"
+            "type:'streamlit:componentValue',"
+            "value:'enter',"
+            "dataType:'json'},'*')"
         )
-        _landing_html = _landing_html.replace('href="#signup"', f'href="{_enter_js}"')
+        _landing_html = _landing_html.replace(
+            'href="#signup"',
+            f'href="javascript:void(0)" onclick="{_cta_onclick}"'
+        )
         # Inject a script that repositions the Streamlit component iframe to cover the
         # full viewport (position:fixed; 100vw × 100vh; max z-index).
         # This eliminates the "screen within screen" effect caused by _stc.html().
@@ -911,7 +917,11 @@ if st.session_state.get('show_landing', True):
             '})()</script>'
         )
         _landing_html = _landing_html.replace('<head>', '<head>' + _fs_script, 1)
-        _stc.html(_landing_html, height=600, scrolling=True)
+        _landing_result = _stc.html(_landing_html, height=600, scrolling=True)
+        # CTA button sends componentValue "enter" → Streamlit re-runs → catch it here.
+        if _landing_result == 'enter':
+            st.session_state['show_landing'] = False
+            st.rerun()
     else:
         # Fallback if landing.html is missing
         st.markdown(
