@@ -62,12 +62,7 @@
       display: flex; align-items: center;
       font-size: 22px; font-weight: 800; color: var(--navy);
     }
-    .nav-logo .corner {
-      display: inline-block; width: 20px; height: 20px;
-      border-top: 3px solid var(--amber); border-left: 3px solid var(--amber);
-      border-radius: 3px 0 0 0; margin-right: 8px;
-    }
-    .nav-logo span { color: var(--amber); font-weight: 300; letter-spacing: 2px; }
+    /* logo-corner + nav-logo span replaced by unified SVG — no longer needed */
     .nav-links { display: flex; align-items: center; gap: 12px; }
     .nav-link { font-size: 14px; color: var(--grey-tx); padding: 6px 12px; border-radius: 6px; transition: all .15s; }
     .nav-link:hover { color: var(--navy); background: var(--grey-lt); }
@@ -297,6 +292,7 @@
     }
     .foot-logo {
       font-size: 20px; font-weight: 800; color: #fff; margin-bottom: 8px;
+      display: flex; align-items: center; justify-content: center;
     }
     .foot-logo span { color: var(--amber); font-weight: 300; letter-spacing: 2px; }
     footer p { margin-top: 6px; }
@@ -311,7 +307,12 @@
   <div class="container">
     <div class="nav-inner">
       <a href="#" class="nav-logo">
-        <span class="corner"></span>Prop<span>folio</span>
+        <svg width="160" height="30" viewBox="0 0 160 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <polyline points="13,4 4,4 4,13" stroke="#FFA726" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+          <text x="18" y="24" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="22">
+            <tspan font-weight="800" fill="#1a1a2e" letter-spacing="-0.5">Prop</tspan><tspan font-weight="300" fill="#FFA726" letter-spacing="2" dx="4">folio</tspan>
+          </text>
+        </svg>
       </a>
       <div class="nav-links">
         <a href="#how" class="nav-link">How it works</a>
@@ -543,14 +544,14 @@
         <div class="plan-price"><sup>$</sup>0</div>
         <div class="plan-desc">1 property · full FY history.<br>No credit card. No time limit.</div>
         <ul class="plan-features">
-          <li><span class="no">🔒</span> Unlimited properties</li>
+          <li><span class="ck">✓</span> 1 Property (Limited)</li>
           <li><span class="ck">✓</span> Full FY history — unlimited</li>
           <li><span class="ck">✓</span> PDF &amp; CSV / TSV auto-parse</li>
           <li><span class="ck">✓</span> Excel P&amp;L download</li>
-          <li><span class="no">🔒</span> ⚡ Add Entry (fixed &amp; recurring)</li>
           <li><span class="ck">✓</span> Session save &amp; restore</li>
-          <li><span class="no">🔒</span> Restore from Excel</li>
           <li><span class="ck">✓</span> Monthly update workflow</li>
+          <li><span class="no">🔒</span> ⚡ Add Entry (fixed &amp; recurring)</li>
+          <li><span class="no">🔒</span> Restore from Excel</li>
           <li><span class="no">🔒</span> Portfolio Summary tab</li>
         </ul>
         <a href="#signup" class="btn btn-outline plan-cta btn-lg">Try Free</a>
@@ -567,10 +568,10 @@
           <li><span class="ck">✓</span> Full FY history — unlimited</li>
           <li><span class="ck">✓</span> PDF &amp; CSV / TSV auto-parse</li>
           <li><span class="ck">✓</span> Excel P&amp;L download</li>
-          <li><span class="ck">✓</span> ⚡ Add Entry (fixed &amp; recurring)</li>
           <li><span class="ck">✓</span> Session save &amp; restore</li>
-          <li><span class="ck">✓</span> Restore from Excel</li>
           <li><span class="ck">✓</span> Monthly update workflow</li>
+          <li><span class="ck">✓</span> ⚡ Add Entry (fixed &amp; recurring)</li>
+          <li><span class="ck">✓</span> Restore from Excel</li>
           <li><span class="ck">✓</span> Portfolio Summary tab</li>
         </ul>
         <a href="#signup" class="btn btn-primary plan-cta btn-lg">Get Pro for $49 →</a>
@@ -599,7 +600,14 @@
 <!-- ── Footer ────────────────────────────────────────────────────── -->
 <footer>
   <div class="container">
-    <div class="foot-logo">Prop<span>folio</span></div>
+    <div class="foot-logo">
+      <svg width="160" height="30" viewBox="0 0 160 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <polyline points="13,4 4,4 4,13" stroke="#FFA726" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="18" y="24" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="22">
+          <tspan font-weight="800" fill="#ffffff" letter-spacing="-0.5">Prop</tspan><tspan font-weight="300" fill="#FFA726" letter-spacing="2" dx="4">folio</tspan>
+        </text>
+      </svg>
+    </div>
     <p>Property Portfolio P&L Builder · Built for Australian investors</p>
     <p style="margin-top:20px;">
       © 2026 Propfolio &nbsp;·&nbsp;

@@ -1091,7 +1091,7 @@ def _detect_year_month(text: str) -> tuple[int, int] | None:
         # Require 4-digit year to avoid "Feb 25" (history table rows) matching as Feb 2025
         r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[- ](\d{4})\b',
         r'(\d{1,2})[/-](\d{4})\b',
-        r'period[:\s]+\d{1,2}[/-]\d{1,2}[/-](\d{4})',
+        r'period[:\s]+\d{1,2}[/-](\d{1,2})[/-](\d{4})',  # day/month/year — 2 groups
         r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|'
         r'september|october|november|december)\s+(\d{4})',
     ]
@@ -1350,22 +1350,14 @@ def _extract_console_line_items(text: str) -> tuple:
             re.search(r'\bto\s+Agent\s*\(', text, re.IGNORECASE)):
         return bill_items, non_mgmt_totals
 
-    # Isolate the Expenses Debit section (between header and total line)
-    expenses_m = re.search(
-        r'Expenses\s+Debit\s*\n(.*?)(?=Total\s+expenses:|Payments\s+to\s+owner)',
-        text, re.IGNORECASE | re.DOTALL
-    )
-    if not expenses_m:
-        return bill_items, non_mgmt_totals
-
-    expenses_text = expenses_m.group(1)
-
     # ── Normalize multi-line entries ──────────────────────────────────────────
     # PDF rendering sometimes wraps a single logical entry across two lines,
     # placing the $amount before the final "suburb STATE POSTCODE)" fragment.
     # Strategy: join any line that does NOT start with a date to the previous line.
+    # We work on the full text (no section isolation) so this handles any section
+    # header format variation (e.g. "Total Expenses Debit:" vs "Total expenses:").
     _date_re = re.compile(r'^\d{2}/\d{2}/\d{2,4}\s+-')
-    _raw_lines = expenses_text.split('\n')
+    _raw_lines = text.split('\n')
     _joined: list = []
     for _ln in _raw_lines:
         _stripped = _ln.strip()
@@ -1533,8 +1525,11 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
             (r'money\s+out[ \t:]+\$?([\d,]+\.?\d*)',                  'money_out'),
             (r'you\s+received[ \t:]+\$?([\d,]+\.?\d*)',               'eft'),
             # Console Australia (used by NAS agency)
-            (r'total\s+income[:\s]+\$([\d,]+\.?\d*)',                 'money_in'),
-            (r'total\s+expenses[:\s]+\$([\d,]+\.?\d*)',               'money_out'),
+            # Format may include "Credit"/"Debit" qualifier:
+            #   "Total Income Credit: $3,080.00"  OR  "Total income: $3,080.00"
+            #   "Total Expenses Debit: $676.04"   OR  "Total expenses: $676.04"
+            (r'total\s+income(?:\s+credit)?[:\s]+\$([\d,]+\.?\d*)',   'money_in'),
+            (r'total\s+expenses?(?:\s+debit)?[:\s]+\$([\d,]+\.?\d*)', 'money_out'),
             # "Total payments: Balance…income…expenses = $2,831.92"
             (r'total\s+payments[^=\n]{0,300}=\s+\$([\d,]+\.?\d*)',   'eft'),
             # Certainty / PropertyTree
@@ -3123,7 +3118,15 @@ def parse_pdf(file_bytes: bytes, filename: str = '', doc_type: str = 'auto') -> 
         return parse_bank_statement(file_bytes, filename)
 
     # ── 1. Rental / ownership statement ──────────────────────────────────────
-    if any(k in text for k in ['money in', 'money out', 'ownership statement',
+    # 'owner statement'     — Console/Reapit (NAS, Harcourts, etc.)
+    # 'rental statement'    — generic agency formats
+    # 'total income'        — Console: "Total Income Credit: $X"
+    # 'total expenses'      — Console: "Total Expenses Debit: $X"
+    # 'ownership statement' — Ailo
+    if any(k in text for k in ['money in', 'money out',
+                                'ownership statement', 'owner statement',
+                                'rental statement',
+                                'total income', 'total expenses',
                                 'eft to owner', 'disbursement to owner',
                                 'landlord statement']):
         return parse_rental_statement(file_bytes, filename)

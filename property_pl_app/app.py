@@ -621,31 +621,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ──────────────────────────────────────────────────────────
-# APP_ENV='dev'  → start with 'free' plan so gating is active by default
-# APP_ENV absent → Main/production; start with 'pro' (all features unlocked)
-#
-# Streamlit Cloud exposes Secrets via st.secrets, NOT via os.environ by default.
-# (os.environ only works if [env] table is used in secrets.toml — uncommon.)
-# → Check both: os.environ first, then st.secrets as fallback.
-import os as _os_init
-def _get_app_env() -> str:
-    """Read APP_ENV from os.environ first, then st.secrets as fallback.
-    Returns a clean lowercase-stripped string, or '' if not set."""
-    v = _os_init.environ.get('APP_ENV', '').strip()
-    if not v:
-        try:
-            v = str(st.secrets.get('APP_ENV') or '').strip()
-        except Exception:
-            v = ''
-    return v
-
-_is_dev = (_get_app_env() == 'dev')
-_default_user_plan = 'free' if _is_dev else 'pro'
+# user_plan defaults to 'pro'. The Plan toggle (always visible in the sidebar)
+# lets you switch to 'free' to test gating behaviour.
+# TODO: replace Plan toggle with Supabase auth result when authentication is wired up.
 
 for key, default in {
     'show_landing':         True,   # True = show marketing landing page
     'user_email':           None,   # populated after Supabase auth
-    'user_plan':            _default_user_plan,  # 'free' in Dev; 'pro' in Main
+    'user_plan':            'pro',  # 'free' | 'pro'  — set via Plan toggle; later via Supabase auth
     'step':                 0,      # 0 = guide page (landing)
     'properties':           [],
     'parsed_results':       [],
@@ -659,11 +642,12 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Enforce plan on every render (prevents stale session state) ────────────────
-# On Main (APP_ENV != 'dev'): user_plan is always 'pro' — no UI exists to change it.
-# On Dev: user_plan is initialised to 'free' above; Dev toggle can switch it freely.
-if not _is_dev:
-    st.session_state['user_plan'] = 'pro'
+# ── Landing → App navigation via query param ──────────────────────────────────
+# The landing page iframe fires: window.parent.location.search = '?enter=1'
+# Streamlit re-runs, detects the param here, clears show_landing, clears param.
+if st.query_params.get('enter'):
+    st.session_state['show_landing'] = False
+    st.query_params.clear()
 
 MONTH_NAMES = {1:'January',2:'February',3:'March',4:'April',5:'May',6:'June',
                7:'July',8:'August',9:'September',10:'October',11:'November',12:'December'}
@@ -706,20 +690,15 @@ FREE_PROP_LIMIT   = 1    # max properties on free plan
 FREE_MONTH_LIMIT  = 6    # max months of data on free plan
 
 def _is_pro() -> bool:
-    """
-    Returns True if the current session has Pro access.
-
-    user_plan is initialised from APP_ENV at session start:
-      APP_ENV = "dev"  → user_plan defaults to 'free'  (gating active; Dev toggle can switch)
-      APP_ENV absent   → user_plan defaults to 'pro'   (Main / production — all unlocked)
-
-    This function simply reads user_plan — no environment check needed here.
+    """True when the current session has Pro access.
+    Reads user_plan from session state — set by the Plan toggle (Dev)
+    or, when wired up, by Supabase auth result.
     """
     return st.session_state.get('user_plan', 'pro') == 'pro'
 
 def _plan_badge_html(plan: str | None = None) -> str:
     """Return an inline HTML badge chip for the given plan (or current session plan)."""
-    p = plan or st.session_state.get('user_plan', 'free')
+    p = plan or st.session_state.get('user_plan', 'pro')
     if p == 'pro':
         return '<span class="plan-badge plan-badge-pro">PRO</span>'
     return '<span class="plan-badge plan-badge-free">FREE</span>'
@@ -808,7 +787,7 @@ with st.sidebar:
 """, unsafe_allow_html=True)
 
     # ── Plan badge ────────────────────────────────────────────────────────────
-    _sb_plan = st.session_state.get('user_plan', 'free')
+    _sb_plan = st.session_state.get('user_plan', 'pro')
     _sb_email = st.session_state.get('user_email')
     if _sb_email:
         _badge_cls = 'plan-badge-pro' if _sb_plan == 'pro' else 'plan-badge-free'
@@ -883,18 +862,17 @@ with st.sidebar:
                     del st.session_state[k]
             st.rerun()
 
-        # ── Dev: plan toggle — only shown when APP_ENV=dev (never in production) ──
-        if _is_dev:
-            with st.expander("🛠 Dev — Plan toggle", expanded=False):
-                _dev_plan = st.selectbox(
-                    "Simulate plan", ['free', 'pro'],
-                    index=0 if st.session_state.get('user_plan', 'free') == 'free' else 1,
-                    key='_dev_plan_select',
-                    label_visibility='collapsed',
-                )
-                if _dev_plan != st.session_state.get('user_plan', 'free'):
-                    st.session_state['user_plan'] = _dev_plan
-                    st.rerun()
+        # ── Plan toggle (always shown — replace with Supabase auth result later) ──
+        with st.expander("🛠 Plan toggle", expanded=False):
+            _dev_plan = st.selectbox(
+                "Simulate plan", ['pro', 'free'],
+                index=0 if st.session_state.get('user_plan', 'pro') == 'pro' else 1,
+                key='_dev_plan_select',
+                label_visibility='collapsed',
+            )
+            if _dev_plan != st.session_state.get('user_plan', 'pro'):
+                st.session_state['user_plan'] = _dev_plan
+                st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LANDING PAGE (pre-app marketing view)
@@ -904,14 +882,32 @@ if st.session_state.get('show_landing', True):
     if os.path.exists(_landing_path):
         with open(_landing_path, 'r', encoding='utf-8') as _f:
             _landing_html = _f.read()
-        # Inject CTA override: clicking any .cta-btn inside the iframe would
-        # navigate the iframe, so we replace the CTA hrefs with a postMessage
-        # and catch it in the parent to trigger st.rerun via a hidden button.
+        # Replace CTA hrefs — clicking navigates window.parent to ?enter=1.
+        # Streamlit re-runs, sees the query param at the top of app.py,
+        # sets show_landing=False, and clears the param.  No hidden buttons needed.
         _landing_html = _landing_html.replace(
             'href="#signup"',
-            'href="javascript:void(0)" onclick="window.parent.postMessage(\'propfolio_try_free\',\'*\')"'
+            'href="javascript:void(0)" onclick="window.parent.location.search=\'?enter=1\'"'
         )
-        _stc.html(_landing_html, height=3600, scrolling=True)
+        # Inject a script that repositions the Streamlit component iframe to cover the
+        # full viewport (position:fixed; 100vw × 100vh; max z-index).
+        # This eliminates the "screen within screen" effect caused by _stc.html().
+        _fs_script = (
+            '<script>(function(){'
+            'function _fs(){'
+            'var e=window.frameElement;'
+            'if(!e)return;'
+            'e.style.cssText="position:fixed!important;top:0!important;left:0!important;'
+            'width:100vw!important;height:100vh!important;'
+            'z-index:2147483647!important;border:none!important;margin:0!important;";'
+            '}'
+            'if(document.readyState==="loading")'
+            'document.addEventListener("DOMContentLoaded",_fs);'
+            'else _fs();'
+            '})()</script>'
+        )
+        _landing_html = _landing_html.replace('<head>', '<head>' + _fs_script, 1)
+        _stc.html(_landing_html, height=600, scrolling=True)
     else:
         # Fallback if landing.html is missing
         st.markdown(
@@ -923,34 +919,6 @@ if st.session_state.get('show_landing', True):
             '</div>', unsafe_allow_html=True
         )
 
-    # ── Hidden trigger button — clicked via postMessage from landing iframe ──────
-    # The landing.html CTAs fire: window.parent.postMessage('propfolio_try_free','*')
-    # A 0-height JS component listens and clicks this hidden button programmatically.
-    st.markdown('<div style="position:absolute;width:0;height:0;overflow:hidden;opacity:0;">', unsafe_allow_html=True)
-    if st.button('PROPFOLIO_ENTER', key='landing_enter_trigger'):
-        st.session_state['show_landing'] = False
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # JS listener: catches postMessage from the landing iframe and clicks the hidden button
-    _stc.html("""
-<script>
-(function () {
-    function clickEnter() {
-        var btns = window.parent.document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {
-            if (btns[i].innerText.trim() === 'PROPFOLIO_ENTER') {
-                btns[i].click();
-                return;
-            }
-        }
-    }
-    window.addEventListener('message', function (e) {
-        if (e.data === 'propfolio_try_free') { clickEnter(); }
-    });
-})();
-</script>
-""", height=0)
     st.stop()
 
 # ── Upgrade banner — shown at top of every in-app page for Free users ─────────
@@ -964,11 +932,11 @@ if st.session_state.step == 0:
         '<div class="main-header">'
         '<svg width="248" height="46" viewBox="0 0 248 46" fill="none" xmlns="http://www.w3.org/2000/svg">'
         '<!-- corner mark embracing P -->'
-        '<polyline points="18,6 8,6 8,16" stroke="#FFA726" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
-        '<!-- Prop -->'
-        '<text x="28" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34" font-weight="800" fill="#FFFFFF" letter-spacing="-1">Prop</text>'
-        '<!-- folio -->'
-        '<text x="112" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34" font-weight="300" fill="#FFA726" letter-spacing="3">folio</text>'
+        '<polyline points="20,6 8,6 8,18" stroke="#FFA726" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+        '<text x="28" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34">'
+        '<tspan font-weight="800" fill="#FFFFFF" letter-spacing="-1">Prop</tspan>'
+        '<tspan font-weight="300" fill="#FFA726" letter-spacing="3" dx="6">folio</tspan>'
+        '</text>'
         '</svg>'
         '<p style="margin:10px 0 0;font-size:17px;color:#FFFFFF;">Negatively or positively geared — and by how much?</p>'
         '<p style="margin:6px 0 0;font-size:17px;color:#FFFFFF;">'
@@ -1117,9 +1085,11 @@ elif st.session_state.step == 1:
     st.markdown(
         '<div class="main-header">'
         '<svg width="248" height="46" viewBox="0 0 248 46" fill="none" xmlns="http://www.w3.org/2000/svg">'
-        '<polyline points="18,6 8,6 8,16" stroke="#FFA726" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
-        '<text x="28" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34" font-weight="800" fill="#FFFFFF" letter-spacing="-1">Prop</text>'
-        '<text x="112" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34" font-weight="300" fill="#FFA726" letter-spacing="3">folio</text>'
+        '<polyline points="20,6 8,6 8,18" stroke="#FFA726" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+        '<text x="28" y="37" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" font-size="34">'
+        '<tspan font-weight="800" fill="#FFFFFF" letter-spacing="-1">Prop</tspan>'
+        '<tspan font-weight="300" fill="#FFA726" letter-spacing="3" dx="6">folio</tspan>'
+        '</text>'
         '</svg>'
         '<p style="margin:8px 0 0;opacity:0.8;font-size:13px;">Upload PDFs (rental statements, bank transactions, utility bills) '
         '→ Get a fully formatted Excel P&amp;L instantly.</p>'
