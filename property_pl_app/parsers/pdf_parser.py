@@ -1949,11 +1949,19 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
       INTEREST ADJUSTMENT (credit)  → subtracted from Mortgage Interest
       LOAN PAYMENT (credit)         → summed → Less: Mortgage Repayment
 
+    Interest-Only (IO) offset loans:
+      INTEREST (debit)            → Mortgage Interest captured as usual
+      INTEREST REDIRECTED FROM …  → credit that nets the interest back to zero;
+                                     skipped here so net balance is preserved,
+                                     but the INTEREST debit above IS kept.
+      When repayment == 0 and interest > 0 (full IO period), only the
+      Mortgage Interest financing entry is emitted — no repayment row.
+
     Skips:
-      INTEREST REDIRECTED FROM … – offset account paying interest (IO loan)
       ANZ M-BANKING TRANSFER …   – manual offset transfer paying interest
       LOAN DRAWDOWN / PROGRESSIVE DRAWDOWN – principal advances
       BALANCE BROUGHT FORWARD, rate-change notices, closing transfers, etc.
+      Months where both interest == 0 and repayment == 0 (nothing to record)
 
     Monthly aggregation:
       All weekly / fortnightly / monthly payments are summed to a single
@@ -2054,14 +2062,26 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
         interest  = max(round(data['interest'], 2), 0.0)   # guard against tiny negatives
         repayment = round(data['repayment'], 2)
 
-        # Skip months with no direct repayment — this covers:
-        #   • Pure IO periods (interest paid via offset account / INTEREST REDIRECTED)
-        #   • Partial boundary months where no LOAN PAYMENT was recorded
-        # If nothing was repaid from this loan account, there is nothing to record.
-        if repayment == 0:
+        # Skip months where nothing at all was recorded
+        if repayment == 0 and interest == 0:
             continue
 
         date_str = f'01/{mon:02d}/{yr}'   # representative date = 1st of month
+
+        # ── IO offset months: interest paid via offset, no direct LOAN PAYMENT ──
+        # Only emit the financing interest entry — no repayment or principal rows.
+        if repayment == 0 and interest > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Interest (paid via offset account)',
+                'amount':      interest,
+                'type':        'debit',
+                'section':     'financing',
+                'category':    'Mortgage Interest',
+            })
+            continue
+
+        # ── Normal P&I or partial-period months ─────────────────────────────────
         _partial = (interest == 0)       # boundary month — interest in adjacent cycle
 
         if interest > 0:
