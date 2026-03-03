@@ -621,10 +621,28 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ──────────────────────────────────────────────────────────
+# APP_ENV='dev'  → start with 'free' plan so gating is active by default
+# APP_ENV absent → Main/production; start with 'pro' (all features unlocked)
+#
+# Streamlit Cloud exposes Secrets via st.secrets, NOT via os.environ by default.
+# (os.environ only works if [env] table is used in secrets.toml — uncommon.)
+# → Check both: os.environ first, then st.secrets as fallback.
+import os as _os_init
+def _get_app_env() -> str:
+    val = _os_init.environ.get('APP_ENV', '')
+    if not val:
+        try:
+            val = st.secrets.get('APP_ENV', '') or ''
+        except Exception:
+            pass
+    return val
+
+_default_user_plan = 'free' if _get_app_env() == 'dev' else 'pro'
+
 for key, default in {
     'show_landing':         True,   # True = show marketing landing page
     'user_email':           None,   # populated after Supabase auth
-    'user_plan':            'free', # 'free' | 'pro'
+    'user_plan':            _default_user_plan,  # 'free' gated in Dev; 'pro' unlocked in Main
     'step':                 0,      # 0 = guide page (landing)
     'properties':           [],
     'parsed_results':       [],
@@ -679,8 +697,16 @@ FREE_PROP_LIMIT   = 1    # max properties on free plan
 FREE_MONTH_LIMIT  = 6    # max months of data on free plan
 
 def _is_pro() -> bool:
-    """Main branch — all features unlocked (no gating)."""
-    return True
+    """
+    Returns True if the current session has Pro access.
+
+    user_plan is initialised from APP_ENV at session start:
+      APP_ENV = "dev"  → user_plan defaults to 'free'  (gating active; Dev toggle can switch)
+      APP_ENV absent   → user_plan defaults to 'pro'   (Main / production — all unlocked)
+
+    This function simply reads user_plan — no environment check needed here.
+    """
+    return st.session_state.get('user_plan', 'pro') == 'pro'
 
 def _plan_badge_html(plan: str | None = None) -> str:
     """Return an inline HTML badge chip for the given plan (or current session plan)."""
@@ -690,12 +716,44 @@ def _plan_badge_html(plan: str | None = None) -> str:
     return '<span class="plan-badge plan-badge-free">FREE</span>'
 
 def _render_upgrade_banner() -> None:
-    """Amber upgrade strip shown at the top of every in-app page for Free users."""
+    """Plan strip shown at the top of every in-app page.
+    Free → amber banner with upgrade CTA.
+    Pro  → navy banner with PRO badge.
+    """
     if not _is_pro():
+        # ── Free: amber upgrade strip ──────────────────────────────────────────
         st.markdown(
-            f'<div class="upgrade-banner">'
-            f'⚡ Free plan — 1 property · 6 months data · limited features'
-            f'<a href="{STRIPE_URL}" target="_blank">Upgrade to Pro — $49 once →</a>'
+            f'<div style="background:linear-gradient(90deg,#FFA726 0%,#FF8F00 100%);'
+            f'color:#1a1a2e;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
+            f'font-size:14px;font-weight:600;display:flex;align-items:center;'
+            f'justify-content:space-between;gap:12px;">'
+            f'⚡ Free plan — 1 property · Save &amp; Load session · limited features'
+            f'<a href="{STRIPE_URL}" target="_blank" style="display:inline-block;'
+            f'background:#FFFFFF;color:#E65100 !important;text-decoration:none;'
+            f'padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;'
+            f'white-space:nowrap;">Upgrade to Pro — $49 once →</a>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        # ── Pro: navy strip with PRO badge + feature summary ───────────────────
+        st.markdown(
+            f'<div style="background:#1A237E;'
+            f'color:#FFFFFF;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
+            f'font-size:13px;font-weight:400;display:flex;align-items:center;'
+            f'justify-content:space-between;gap:12px;">'
+            f'<span>'
+            f'<span style="font-weight:700;margin-right:14px;">All features unlocked</span>'
+            f'<span style="opacity:0.7;font-size:12px;">'
+            f'✅ Unlimited properties &nbsp;·&nbsp; '
+            f'✅ Full FY history &nbsp;·&nbsp; '
+            f'✅ Add Entry &nbsp;·&nbsp; '
+            f'✅ Portfolio Summary tab &nbsp;·&nbsp; '
+            f'✅ Restore from Excel'
+            f'</span></span>'
+            f'<span style="background:linear-gradient(90deg,#FFA726 0%,#FF8F00 100%);'
+            f'color:#1a1a2e;padding:4px 14px;border-radius:20px;font-size:12px;'
+            f'font-weight:800;letter-spacing:0.5px;white-space:nowrap;flex-shrink:0;">PRO</span>'
             f'</div>',
             unsafe_allow_html=True
         )
@@ -816,17 +874,18 @@ with st.sidebar:
                     del st.session_state[k]
             st.rerun()
 
-        # ── Dev: plan toggle (remove after Supabase auth is wired up) ─────────
-        with st.expander("🛠 Dev — Plan toggle", expanded=False):
-            _dev_plan = st.selectbox(
-                "Simulate plan", ['free', 'pro'],
-                index=0 if st.session_state.get('user_plan', 'free') == 'free' else 1,
-                key='_dev_plan_select',
-                label_visibility='collapsed',
-            )
-            if _dev_plan != st.session_state.get('user_plan', 'free'):
-                st.session_state['user_plan'] = _dev_plan
-                st.rerun()
+        # ── Dev: plan toggle — only shown when APP_ENV=dev (never in production) ──
+        if _get_app_env() == 'dev':
+            with st.expander("🛠 Dev — Plan toggle", expanded=False):
+                _dev_plan = st.selectbox(
+                    "Simulate plan", ['free', 'pro'],
+                    index=0 if st.session_state.get('user_plan', 'free') == 'free' else 1,
+                    key='_dev_plan_select',
+                    label_visibility='collapsed',
+                )
+                if _dev_plan != st.session_state.get('user_plan', 'free'):
+                    st.session_state['user_plan'] = _dev_plan
+                    st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LANDING PAGE (pre-app marketing view)
@@ -1172,15 +1231,20 @@ elif st.session_state.step == 1:
     col1, col2 = st.columns(2)
     with col1:
         # Gate 1: Free plan → 1 property max; Pro → unlimited via number input
+        # NOTE: max_value only controls +/- buttons, not typed input.
+        # Server-side enforcement via st.rerun() is required for typed values.
         n_props = st.number_input(
             "Number of properties",
             min_value=1,
             max_value=1 if not _is_pro() else None,
-            value=int(st.session_state.get('setup_n_props', 1)),
             step=1,
             key='setup_n_props',
             help="Each property gets its own tab.",
         )
+        # Server-side enforcement: if user typed > 1 while on Free plan, clamp and rerun.
+        if not _is_pro() and n_props > 1:
+            st.session_state['setup_n_props'] = 1
+            st.rerun()
         if not _is_pro():
             st.markdown(
                 f'<div style="font-size:12px;color:#E65100;margin-top:-8px;margin-bottom:4px;">'
@@ -1369,16 +1433,6 @@ elif st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.markdown('<div class="step-badge">STEP 2 of 4</div>', unsafe_allow_html=True)
     st.markdown("### Upload PDFs")
-
-    # Gate 6: 6-month data cap on Free plan
-    if not _is_pro():
-        st.markdown(
-            f'<div class="warn-box">🔒 <b>Free plan — 6 months data limit.</b> '
-            f'Only the 6 most recent months will be included in your Excel output. '
-            f'<a href="{STRIPE_URL}" target="_blank" style="color:#E65100;font-weight:700;">'
-            f'Upgrade to Pro ($49 once)</a> for full FY history.</div>',
-            unsafe_allow_html=True
-        )
 
     if st.session_state.get('session_loaded'):
         n_months = sum(len(p['data']) for p in st.session_state.properties)
@@ -2188,40 +2242,28 @@ elif st.session_state.step == 4:
                 type="primary",
             )
         with save_col:
-            # Gate 4: Save Session — Pro only
-            if _is_pro():
-                session_json = _session_to_json()
-                save_filename = (
-                    f"property_pl_session_"
-                    f"{datetime.datetime.now().strftime('%Y%m')}.json"
-                )
-                st.download_button(
-                    label="💾 Save Session (for next month)",
-                    data=session_json,
-                    file_name=save_filename,
-                    mime="application/json",
-                    use_container_width=True,
-                    help="Save all property configs + data as JSON. "
-                         "Load it next month to add new PDFs on top of existing data.",
-                )
-            else:
-                st.markdown(
-                    f'<div style="border:2px dashed #D0D0D0;border-radius:8px;padding:12px 14px;'
-                    f'text-align:center;background:#fafafa;">'
-                    f'🔒 <b style="color:#333;">Save Session</b><br>'
-                    f'<span style="font-size:12px;color:#777;">Keep your data for next month — Pro only</span><br>'
-                    f'<a href="{STRIPE_URL}" target="_blank" class="lock-cta" '
-                    f'style="margin-top:10px;display:inline-block;">Upgrade — $49 once →</a>'
-                    f'</div>', unsafe_allow_html=True
-                )
-
-        if _is_pro():
-            st.markdown(
-                '<div class="info-box">💡 <b>Next month workflow</b>: '
-                'Click "Save Session" → next month, go to Step 1 → "Load previous session" '
-                '→ upload only the new month\'s PDFs → the app handles add/update automatically.'
-                '</div>', unsafe_allow_html=True
+            # Save Session — Free & Pro
+            session_json = _session_to_json()
+            save_filename = (
+                f"property_pl_session_"
+                f"{datetime.datetime.now().strftime('%Y%m')}.json"
             )
+            st.download_button(
+                label="💾 Save Session (for next month)",
+                data=session_json,
+                file_name=save_filename,
+                mime="application/json",
+                use_container_width=True,
+                help="Save all property configs + data as JSON. "
+                     "Load it next month to add new PDFs on top of existing data.",
+            )
+
+        st.markdown(
+            '<div class="info-box">💡 <b>Next month workflow</b>: '
+            'Click "Save Session" → next month, go to Step 1 → "Load previous session" '
+            '→ upload only the new month\'s PDFs → the app handles add/update automatically.'
+            '</div>', unsafe_allow_html=True
+        )
 
         st.markdown("---")
         st.markdown("#### What's in the Excel?")

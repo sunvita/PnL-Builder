@@ -771,18 +771,26 @@ def _push_to_github(content: list, new_keyword: str = '',
     }
 
     try:
-        # Step 1: get current file SHA (required for update)
-        req = urllib.request.Request(api, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            sha = _json.loads(r.read().decode())['sha']
+        # Step 1: get current file SHA (required for update; None means file doesn't exist yet)
+        sha = None
+        try:
+            req = urllib.request.Request(api, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                sha = _json.loads(r.read().decode()).get('sha')
+        except urllib.error.HTTPError as _e:
+            if _e.code != 404:
+                return   # unexpected error — skip push
+            # 404 → file doesn't exist yet; proceed without sha (creates new file)
 
-        # Step 2: PUT updated file
+        # Step 2: PUT updated file (create if sha is None, update otherwise)
         new_content = _json.dumps(content, indent=2, ensure_ascii=False)
-        body = _json.dumps({
+        put_body: dict = {
             'message': f'chore: learn category rule "{new_keyword}"',
             'content': base64.b64encode(new_content.encode()).decode(),
-            'sha': sha,
-        }).encode()
+        }
+        if sha:
+            put_body['sha'] = sha   # required for update; omit for creation
+        body = _json.dumps(put_body).encode()
         req = urllib.request.Request(api, data=body, headers=headers, method='PUT')
         urllib.request.urlopen(req, timeout=10)
     except Exception:
@@ -867,6 +875,52 @@ _learned_cache       = _load_learned_categories()
 _learned_regex_rules = _load_learned_regex_rules()
 
 
+# ── Rental statement financial content guard ──────────────────────────────────
+# Used as a pre-check before triggering the LLM Tier C fallback.
+# Distinguishes genuine parse failures (money IS present but regex missed it)
+# from legitimately empty documents or unrelated PDFs.
+#
+# Aug 2024 NAS example: text contains "Total income: $3,080.00", "Owner Statement"
+# → _has_rental_financial_data() returns True → parse failure confirmed → LLM fires.
+# Non-financial PDF (e.g. a rates notice with only small amounts): returns False → LLM skipped.
+
+_RENTAL_KEYWORDS_RE = re.compile(
+    r'\b(rent(?:al)?|owner\s+statement|rent\s+statement|ownership\s+statement'
+    r'|total\s+income|total\s+payments|payments?\s+to\s+owner|disbursement'
+    r'|management\s+fee|eft\s+to|landlord|tenancy|letting)\b',
+    re.IGNORECASE,
+)
+
+
+def _has_rental_financial_data(text: str) -> bool:
+    """
+    Return True when the PDF text contains both:
+      1. At least one dollar amount > $0.1  (any real charge — even $0.84 bank fee)
+      2. At least one rental-specific keyword (confirms this is a rental statement)
+
+    Threshold is intentionally low ($0.1) so that months with ONLY small charges
+    (e.g. NTD $8.80, Bank Charges $0.84 on a vacant month) still trigger the LLM.
+    Even tiny amounts should be captured and their patterns learned — the rental-
+    keyword check (Test 2) is the primary quality gate against non-rental PDFs.
+
+    Quick test on Aug 2024 NAS statement:
+      Dollar amounts found > $0.1: $1540, $3080, $220, $8.80, $200, $246.40 ... → True
+      Rental keyword match: "Owner Statement", "Total income"                    → True
+      Result: True → LLM triggered, patterns learned → same format free next time
+    """
+    # Test 1: any dollar figure > $0.10 — catches even $0.84 bank charges
+    amounts = re.findall(r'\$([\d,]+(?:\.\d+)?)', text)
+    has_any_amount = any(
+        float(a.replace(',', '')) > 0.1
+        for a in amounts
+    )
+    if not has_any_amount:
+        return False
+
+    # Test 2: at least one rental-specific keyword
+    return bool(_RENTAL_KEYWORDS_RE.search(text))
+
+
 def _llm_extract_rental(text: str) -> dict:
     """
     Tier C — LLM fallback using Claude API (Haiku).
@@ -896,12 +950,19 @@ def _llm_extract_rental(text: str) -> dict:
             "Return ONLY a JSON object — no explanation, no markdown.\n\n"
             "Required keys:\n"
             "  money_in   – total rental income received (number, e.g. 3080.00)\n"
-            "  money_out  – total management/agency fees charged (number)\n"
+            "  money_out  – total management/agency fees + all expenses charged (number)\n"
             "  eft        – net amount disbursed to the owner (number)\n"
             "  year       – statement year (integer, e.g. 2025)\n"
             "  month      – statement month 1–12 (integer, e.g. 7 for July)\n"
             "  address    – rental property street address (string)\n"
             "  format_name – software/agency name (e.g. 'Console Australia', 'Certainty')\n\n"
+            "Optional: if the statement lists individual expense line items (not just totals),\n"
+            "also return 'line_items' as an array of objects, each with:\n"
+            "  description – expense description (string)\n"
+            "  amount      – amount (number)\n"
+            "  category    – one of: 'Management Fees', 'Letting Fees', 'Advertising',\n"
+            "                'Maintenance & Repairs', 'Building Insurance',\n"
+            "                'Strata / Body Corporate', 'Miscellaneous'\n\n"
             "Also return a 'patterns' object mapping each found numeric field to the\n"
             "SHORT Python regex pattern (≤70 chars, use \\$ for dollar sign) that\n"
             "identifies its value in this statement, with ONE capture group for the\n"
@@ -939,6 +1000,39 @@ def _llm_extract_rental(text: str) -> dict:
                     pass
         if data.get('address'):
             result['address'] = str(data['address'])
+
+        # ── LLM-extracted line items ────────────────────────────────────────────
+        _llm_items = data.get('line_items')
+        if isinstance(_llm_items, list) and _llm_items:
+            _valid_cats = {
+                'Management Fees', 'Letting Fees', 'Advertising',
+                'Maintenance & Repairs', 'Building Insurance',
+                'Strata / Body Corporate', 'Miscellaneous',
+            }
+            _parsed_items = []
+            _parsed_totals: dict = {}
+            for _li in _llm_items:
+                if not isinstance(_li, dict):
+                    continue
+                _ldesc = str(_li.get('description', '')).strip()
+                _lamt  = _li.get('amount')
+                _lcat  = str(_li.get('category', 'Miscellaneous')).strip()
+                if not _ldesc or _lamt is None:
+                    continue
+                try:
+                    _lamt = round(float(_lamt), 2)
+                except (TypeError, ValueError):
+                    continue
+                if _lamt <= 0:
+                    continue
+                if _lcat not in _valid_cats:
+                    _lcat = 'Miscellaneous'
+                _parsed_items.append({'description': _ldesc, 'category': _lcat, 'amount': _lamt})
+                if _lcat != 'Management Fees':
+                    _parsed_totals[_lcat] = round(_parsed_totals.get(_lcat, 0.0) + _lamt, 2)
+            if _parsed_items:
+                result['line_items'] = _parsed_items     # caller merges into bill_items
+                result['line_item_totals'] = _parsed_totals
 
         # ── Self-learning: save regex patterns returned by the LLM ─────────────
         _fmt = str(data.get('format_name', '')).strip()
@@ -1183,6 +1277,133 @@ def _ailo_bills_from_columns(text: str) -> tuple:
         bill_totals[_pl_cat] = round(bill_totals.get(_pl_cat, 0.0) + _amt, 2)
 
     return bill_items, bill_totals
+
+
+# ── Console / Reapit Owner Statement itemized extractor ───────────────────────
+# Parses individual Expense Debit lines from the Console Australia / Reapit
+# ("Harcourts Focus" etc.) Owner Statement format:
+#   DD/MM/YY - [Description] to Agent ([code] - [address]) $[amount]
+# Maps each description to the correct P&L category so that Advertising,
+# Photography, NTD etc. are NOT lumped into Management Fees.
+
+_CONSOLE_EXPENSE_MAP = [
+    # Management-related (agency charges kept in trust)
+    (['management fee', 'property management', 'admin fee', 'administration fee',
+      'inspection fee', 'condition report', 'routine inspection', 'entry condition',
+      'national tenancy', 'ntd', 'tenancy database', 'bank charge', 'bank fee',
+      'statement fee', 'tribunal', 'ncat', 'vcat', 'wat '],
+     'Management Fees'),
+    # Letting / leasing
+    (['letting fee', 'leasing fee', 'lease renewal', 'tenant placement',
+      'reletting', 're-letting', 'find tenant'],
+     'Letting Fees'),
+    # Advertising / marketing
+    (['advertising', 'marketing', 'photography', 'professional photo',
+      'listing fee', 'signboard', 'floor plan'],
+     'Advertising'),
+    # Maintenance & repairs
+    (['maintenance', 'repair', 'plumb', 'electrical', 'clean', 'lawn',
+      'handyman', 'trade', 'pest', 'paint', 'glazier', 'locksmith'],
+     'Maintenance & Repairs'),
+    # Insurance
+    (['insurance', 'landlord protection'],
+     'Building Insurance'),
+    # Strata / body corporate
+    (['strata', 'body corporate', 'owners corporation'],
+     'Strata / Body Corporate'),
+]
+
+
+def _categorize_console_expense(description: str) -> str:
+    """Map a Console/Reapit expense description string to a P&L category."""
+    desc = description.lower()
+    for keywords, category in _CONSOLE_EXPENSE_MAP:
+        if any(k in desc for k in keywords):
+            return category
+    return 'Miscellaneous'
+
+
+def _extract_console_line_items(text: str) -> tuple:
+    """
+    Extract itemized expense line items from Console Australia / Reapit
+    Owner Statement format (used by agencies like Harcourts Focus).
+
+    Identifies lines in the 'Expenses Debit' section matching:
+        DD/MM/YY - [Description] to Agent ([account] - [address]) $[amount]
+
+    Handles PDF wrapping where the address spans two lines and the
+    dollar amount may appear before the closing parenthesis, e.g.:
+        10/07/24 - National Tenancy Database (16) to Agent (OHALLORAN - ... WA $8.80
+        6110)
+
+    Returns:
+        (bill_items, non_mgmt_totals)
+        bill_items      — list[dict]  full item list for UI display
+        non_mgmt_totals — dict {category: total}  excludes Management Fees
+                          (Management Fees residual is computed by caller)
+    """
+    bill_items: list = []
+    non_mgmt_totals: dict = {}
+
+    # Only applies to Console / Reapit format
+    if not (re.search(r'\bOwner\s+Statement\b', text, re.IGNORECASE) and
+            re.search(r'\bto\s+Agent\s*\(', text, re.IGNORECASE)):
+        return bill_items, non_mgmt_totals
+
+    # Isolate the Expenses Debit section (between header and total line)
+    expenses_m = re.search(
+        r'Expenses\s+Debit\s*\n(.*?)(?=Total\s+expenses:|Payments\s+to\s+owner)',
+        text, re.IGNORECASE | re.DOTALL
+    )
+    if not expenses_m:
+        return bill_items, non_mgmt_totals
+
+    expenses_text = expenses_m.group(1)
+
+    # ── Normalize multi-line entries ──────────────────────────────────────────
+    # PDF rendering sometimes wraps a single logical entry across two lines,
+    # placing the $amount before the final "suburb STATE POSTCODE)" fragment.
+    # Strategy: join any line that does NOT start with a date to the previous line.
+    _date_re = re.compile(r'^\d{2}/\d{2}/\d{2,4}\s+-')
+    _raw_lines = expenses_text.split('\n')
+    _joined: list = []
+    for _ln in _raw_lines:
+        _stripped = _ln.strip()
+        if not _stripped:
+            continue
+        if _joined and not _date_re.match(_stripped):
+            _joined[-1] = _joined[-1] + ' ' + _stripped
+        else:
+            _joined.append(_stripped)
+    expenses_text = '\n'.join(_joined)
+
+    # ── Entry regex ───────────────────────────────────────────────────────────
+    # The amount may appear:
+    #   (a) after the closing ) — normal:  "... to Agent (...) $220.00"
+    #   (b) inside the address  — wrapped: "... to Agent (... WA $8.80 6110)"
+    # Using [^$]* to consume everything before the first $ sign after "to Agent ("
+    entry_pat = re.compile(
+        r'\d{2}/\d{2}/\d{2,4}\s+-\s+'   # DD/MM/YY -
+        r'(.+?)'                          # description (lazy)
+        r'\s+to\s+Agent\s*\('            # to Agent (
+        r'[^$]*'                          # address part before $ (no $ in addresses)
+        r'\$([\d,]+\.?\d*)',              # dollar amount (anywhere after "to Agent (")
+        re.IGNORECASE
+    )
+
+    for m in entry_pat.finditer(expenses_text):
+        desc = m.group(1).strip()
+        amount = _parse_amount(m.group(2))
+        if amount is None or amount <= 0:
+            continue
+        category = _categorize_console_expense(desc)
+        bill_items.append({'description': desc, 'category': category, 'amount': amount})
+        if category != 'Management Fees':
+            non_mgmt_totals[category] = round(
+                non_mgmt_totals.get(category, 0.0) + amount, 2
+            )
+
+    return bill_items, non_mgmt_totals
 
 
 # ── 1. RENTAL / OWNERSHIP STATEMENT ──────────────────────────────────────────
@@ -1465,8 +1686,11 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
             result['parse_source'] = 'table'
 
     # ── Tier C: LLM fallback ───────────────────────────────────────────────
-    # Trigger only if table extraction also found nothing
-    if result['money_in'] == 0.0 and result['eft'] == 0.0:
+    # Trigger only if:
+    #   (a) both regex AND table extraction returned nothing (0 values), AND
+    #   (b) the PDF text actually contains financial data worth extracting
+    #       (guards against non-rental PDFs and legitimately empty months)
+    if result['money_in'] == 0.0 and result['eft'] == 0.0 and _has_rental_financial_data(text):
         _llm = _llm_extract_rental(text)
         _any_llm = False
         for _k in ('money_in', 'money_out', 'eft'):
@@ -1484,6 +1708,23 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
             result['parse_source'] = 'llm'
         else:
             result['parse_source'] = 'failed'
+        # Merge LLM-extracted line items into bill_items if present
+        if _llm.get('line_items') and not result.get('bill_items'):
+            result['bill_items'] = _llm['line_items']
+            for _cat, _total in _llm.get('line_item_totals', {}).items():
+                result['pl_items'][_cat] = _total
+
+    # ── Console/Reapit itemized expense extraction ─────────────────────────────
+    # Run after all numeric-extraction tiers so money_out is already known.
+    # Populates bill_items with individual lines (Advertising, NTD, etc.)
+    # and sets non-Management Fees categories in pl_items directly.
+    # Management Fees residual is computed further below in the else-branch.
+    if not _is_ailo and not result.get('bill_items'):
+        _con_items, _con_totals = _extract_console_line_items(text)
+        if _con_items:
+            result['bill_items'] = _con_items
+            for _cat, _amt in _con_totals.items():
+                result['pl_items'][_cat] = _amt
 
     # Set base items — bill items extracted earlier in the Ailo/PropertyMe branch are preserved
     result['pl_items']['Rental Income'] = result['money_in']
