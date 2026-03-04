@@ -436,30 +436,54 @@ def _merge_parsed_to_properties():
                 if _pl_cat not in new_items and _amt > 0:
                     new_items[_pl_cat] = _amt
         elif result['type'] == 'bank':
-            # Build set of P&L categories already covered by rental statements
-            # for this property + period, so bank data doesn't double-count them.
-            _covered_by_rental: set[str] = set()
-            for _r in st.session_state.parsed_results:
-                if (_r.get('_prop_tab') == tab
-                        and _r.get('type') == 'rental'
-                        and _r.get('year') == yr
-                        and _r.get('month') == mo):
-                    _covered_by_rental.update(
-                        {'Rental Income', 'Management Fees',
-                         'Cash Received (EFT)'})
-                    _covered_by_rental.update(
-                        k for k, v in _r.get('pl_items', {}).items() if v > 0)
+            # Bank statements span multiple months — split each transaction
+            # into its correct calendar-month bucket using the transaction date,
+            # rather than lumping all months under the statement's start date.
+            from collections import defaultdict as _dd
+            _monthly: dict = _dd(dict)
+            for _t in result.get('transactions', []):
+                _dp = _t['date'].split('/')
+                if len(_dp) != 3:
+                    continue
+                _t_mo, _t_yr = int(_dp[1]), int(_dp[2])
+                _t_key = (_t_yr, _t_mo)
+                _cat     = _t['category']
+                _tsec    = _t.get('section', 'cashflow')
+                # Financing / P&L items (income, opex, financing) are stored as
+                # positive amounts — the Excel formulas subtract the section total.
+                # Cashflow items use signed values: debit = negative (cash out),
+                # credit = positive (cash in / informational return of principal).
+                if _tsec == 'cashflow':
+                    _sign = 1 if _t['type'] == 'credit' else -1
+                else:
+                    _sign = 1   # financing, opex, income — always positive
+                _amt  = round(_t['amount'] * _sign, 2)
+                if _amt != 0:
+                    _monthly[_t_key][_cat] = round(
+                        _monthly[_t_key].get(_cat, 0.0) + _amt, 2)
 
-            for _sec, cats in result.get('categorized', {}).items():
-                for cat, amt in cats.items():
-                    # Skip categories already captured from rental statements
-                    # (e.g. Management Fees deducted before disbursement)
-                    if cat in _covered_by_rental:
-                        continue
-                    # Only add positive-net amounts (don't subtract bank debits
-                    # that have already been counted as expenses elsewhere)
-                    if amt != 0:
-                        new_items[cat] = new_items.get(cat, 0) + amt
+            # Store each month's items, checking rental coverage per month
+            for _mk, _mitems in _monthly.items():
+                _m_yr, _m_mo = _mk
+                _covered: set[str] = set()
+                for _r in st.session_state.parsed_results:
+                    if (_r.get('_prop_tab') == tab
+                            and _r.get('type') == 'rental'
+                            and _r.get('year') == _m_yr
+                            and _r.get('month') == _m_mo):
+                        _covered.update(
+                            {'Rental Income', 'Management Fees',
+                             'Cash Received (EFT)'})
+                        _covered.update(
+                            k for k, v in _r.get('pl_items', {}).items()
+                            if v > 0)
+                prop['data'].setdefault(_mk, {})
+                for _cat, _amt in _mitems.items():
+                    if _cat not in _covered and _amt != 0:
+                        _add_or_update(prop['data'][_mk], _cat, _amt)
+
+            # Multi-month path handled above — skip outer single-period store
+            new_items = {}
         elif result['type'] == 'utility':
             utype = result.get('utility_type', 'Miscellaneous')
             new_items = {utype: result.get('amount', 0)}
@@ -1147,17 +1171,16 @@ elif st.session_state.step == 1:
 
     col1, col2 = st.columns(2)
     with col1:
-        # Gate 1: Free plan → 1 property max
-        _prop_options = list(range(1, 11)) if _is_pro() else [1]
-        _prop_help = (
-            "Up to 10 properties. Each gets its own tab."
-            if _is_pro() else
-            "Free plan: 1 property. Upgrade to Pro for unlimited properties."
-        )
-        n_props = st.selectbox(
-            "Number of properties", _prop_options,
+        # Gate 1: Free plan → 1 property max; Pro → unlimited via number input
+        n_props = st.number_input(
+            "Number of properties",
+            min_value=1,
+            max_value=1 if not _is_pro() else None,
+            value=int(st.session_state.get('setup_n_props', 1)),
+            step=1,
             key='setup_n_props',
-            help=_prop_help
+            help="Each property gets its own tab." if _is_pro() else
+                 "Free plan: 1 property. Upgrade to Pro for unlimited properties.",
         )
         if not _is_pro():
             st.markdown(
@@ -1613,6 +1636,23 @@ elif st.session_state.step == 2:
                     txns = result.get('transactions', [])
                     _llm_cnt = result.get('llm_count', 0)
                     _src     = result.get('source', 'pdf').upper()
+
+                    # ── Duplicate statement detection (ANZ / CBA / NAB) ──────
+                    _acct_no = result.get('account_number')
+                    _stmt_no = result.get('statement_number')
+                    if _acct_no and _stmt_no:
+                        _dup_key = (_acct_no, _stmt_no)
+                        _seen_stmts = st.session_state.setdefault('_seen_bank_stmts', {})
+                        if _dup_key in _seen_stmts:
+                            st.warning(
+                                f"⚠️ **Duplicate statement** — Account `{_acct_no}` "
+                                f"Statement #{_stmt_no} was already uploaded "
+                                f"(`{_seen_stmts[_dup_key]}`). "
+                                f"This file will overwrite it with identical data."
+                            )
+                        else:
+                            _seen_stmts[_dup_key] = fname
+
                     if txns:
                         # ── Summary metrics ────────────────────────────────
                         _credits = [t for t in txns if t['type'] == 'credit']

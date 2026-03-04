@@ -865,32 +865,60 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # LANDING PAGE (pre-app marketing view)
 # ─────────────────────────────────────────────────────────────────────────────
-if st.session_state.get('show_landing', True):
+if st.session_state.get('show_landing', False):
     _landing_path = os.path.join(os.path.dirname(__file__), 'landing.html')
     if os.path.exists(_landing_path):
         with open(_landing_path, 'r', encoding='utf-8') as _f:
             _landing_html = _f.read()
-        # Replace CTA hrefs — clicking navigates the top frame to ?enter=1.
-        #
-        # Why this works:
-        #   document.referrer  — always contains the Streamlit app URL inside an iframe,
-        #                        readable without any cross-origin restriction.
-        #   window.open(_top)  — user-gesture-initiated top-frame navigation; allowed by
-        #                        Streamlit's sandbox flag allow-top-navigation-by-user-activation.
-        #   Full page reload   — clears any cached component values; no replay bug.
-        #
-        # Why previous approaches failed:
-        #   window.top.location.pathname — cross-origin read blocked (silent SecurityError)
-        #   postMessage componentValue   — value cached by Streamlit; replays on re-render
-        _cta_onclick = (
-            "window.open("
-            "(document.referrer.split('?')[0]||'/')+'?enter=1',"
-            "'_top')"
-        )
+        # ── Build the app's own base URL for CTA navigation ─────────────────
+        # document.referrer is EMPTY in Streamlit's srcdoc iframe (no referrer
+        # for srcdoc / component URLs), so we build the URL server-side from
+        # Streamlit's own config options — reliable on Cloud and localhost alike.
+        try:
+            _saddr = st.get_option('browser.serverAddress') or 'localhost'
+            _sport = st.get_option('server.port') or 8501
+            _spath = (st.get_option('server.baseUrlPath') or '').strip('/')
+            if _saddr in ('localhost', '127.0.0.1', '0.0.0.0'):
+                _app_base = f'http://localhost:{_sport}'
+            else:
+                _app_base = f'https://{_saddr}'
+            if _spath:
+                _app_base = f'{_app_base}/{_spath}'
+            _app_base = _app_base.rstrip('/')
+        except Exception:
+            _app_base = ''
+
+        # CTA buttons: direct href + target="_top" — no JS required.
+        # Standard anchor navigation is permitted by Streamlit's sandbox flag
+        # allow-top-navigation-by-user-activation on any user click.
+        if _app_base:
+            _cta_attr = f'href="{_app_base}/?enter=1" target="_top"'
+        else:
+            # Fallback (rare): JS using window.location
+            _cta_attr = (
+                'href="javascript:void(0)" '
+                'onclick="window.open((window.location.ancestorOrigins'
+                '?.[0]||window.location.origin)+\'/?enter=1\',\'_top\')"'
+            )
         _landing_html = _landing_html.replace(
             'href="#signup"',
-            f'href="javascript:void(0)" onclick="{_cta_onclick}"'
+            _cta_attr
         )
+        # Fix internal anchor links — in a srcdoc iframe the base URL is the parent page,
+        # so href="#how" resolves to http://localhost:8501/#how and navigates the TOP frame
+        # (allowed by allow-top-navigation-by-user-activation + user click).
+        # Streamlit treats this as a URL change → WebSocket reconnect → session reset → Step 0.
+        # Fix: replace all internal anchors with JS smooth-scroll so they stay inside the iframe.
+        import re as _re
+        def _anchor_to_scroll(m):
+            tid = m.group(1)
+            return (f'href="javascript:void(0)" '
+                    f'onclick="var e=document.getElementById(\'{tid}\');'
+                    f'if(e)e.scrollIntoView({{behavior:\'smooth\'}})"')
+        # Replace href="#id" anchors (excluding already-replaced #signup CTAs)
+        _landing_html = _re.sub(r'href="#([^"]+)"', _anchor_to_scroll, _landing_html)
+        # Bare href="#" (logo, footer links) → no-op
+        _landing_html = _landing_html.replace('href="#"', 'href="javascript:void(0)"')
         # Inject a script that repositions the Streamlit component iframe to cover the
         # full viewport (position:fixed; 100vw × 100vh; max z-index).
         # This eliminates the "screen within screen" effect caused by _stc.html().

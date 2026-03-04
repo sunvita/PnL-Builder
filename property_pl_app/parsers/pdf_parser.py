@@ -488,18 +488,29 @@ def _extract_address(text: str) -> str:
                 return addr
 
     # 2. Australian address regex fallback
+    # Pre-filter: remove date strings (e.g. "3 Mar 2025") that can be mistaken
+    # for street-number prefixes or suburb names when pdfplumber stacks lines.
+    _months = (r'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+               r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|'
+               r'Nov(?:ember)?|Dec(?:ember)?')
+    text_for_addr = re.sub(
+        r'\b\d{1,2}\s+(?:' + _months + r')\s+\d{4}\b', ' ', text, flags=re.IGNORECASE
+    )
     aus_pat = re.compile(
-        r'\d+[A-Za-z]?\s+[\w\'\-]+(?:\s+[\w\'\-]+){0,3}\s+'
+        # (?<![#\w]) — reject digits that immediately follow '#' (statement numbers)
+        # or a word character (e.g. mid-word digits).
+        r'(?<![#\w])\d+[A-Za-z]?\s+[\w\'\-]+(?:\s+[\w\'\-]+){0,3}\s+'
         r'(?:Street|St|Avenue|Ave|Av|Road|Rd|Drive|Dr|Place|Pl|Court|Ct|'
         r'Crescent|Cres|Cr|Boulevard|Blvd|Lane|Ln|Lne|Way|Wy|Close|Cl|'
         r'Circuit|Cct|Cir|Parade|Pde|Terrace|Tce|Highway|Hwy|'
         r'Grove|Gr|Gve|Parkway|Pkwy|Park|Pk|Square|Sq|'
         r'Freeway|Fwy|Rise|Green|Grn|Gate|Gte|Gardens|Gts|Mews|Loop)\b'
-        r'(?:[,\s]+[\w\s]+?)?[,\s]+'
+        # Suburb: must start with a letter (prevents matching date fragments)
+        r'(?:[,\s]+[A-Za-z][\w\s]*?)?[,\s]+'
         r'(?:NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+\d{4}',
         re.IGNORECASE
     )
-    m = aus_pat.search(text)
+    m = aus_pat.search(text_for_addr)
     if m:
         return re.sub(r'\s+', ' ', m.group(0).strip())
 
@@ -1279,6 +1290,88 @@ def _ailo_bills_from_columns(text: str) -> tuple:
     return bill_items, bill_totals
 
 
+# ── Certainty Property (WA) old-format extractor ─────────────────────────────
+# The "old" Certainty format (used by Certainty Property WA, PropertyTree) uses
+# per-room INCOME / EXPENSE sections with standalone subtotal lines.
+# Unlike the "new" Certainty format (OS1 / OS7) it has NO top-level summary
+# "Money In $X / Money Out $X / You Received $X".  The only global summary is
+# "Ownership Account Balance" and "OWNERSHIP PAYMENT".
+#
+# Detection markers:   "OWNERSHIP STATEMENT #N"  +  "OWNERSHIP PAYMENT"
+# money_in  = sum of per-room INCOME subtotals  (standalone $amount line)
+# money_out = sum of per-room EXPENSE subtotals (standalone $amount line)
+
+def _is_certainty_old(text: str) -> bool:
+    return bool(
+        re.search(r'OWNERSHIP\s+STATEMENT\s+#\d+', text, re.IGNORECASE) and
+        re.search(r'OWNERSHIP\s+PAYMENT[:\s]+\$', text, re.IGNORECASE)
+    )
+
+
+def _extract_certainty_old_totals(text: str) -> tuple[float, float]:
+    """
+    Walk per-room INCOME / EXPENSE sections in Certainty old-format statements
+    and sum the section subtotals (standalone "$X.XX" lines).
+
+    Returns (total_money_in, total_money_out).
+
+    Page-break handling: pdfplumber repeats the room header at the top of each
+    new page (e.g. "Room 3/... MONEY OUT MONEY IN" appears twice).  We only
+    reset section-state when the ROOM NUMBER changes so that a repeated header
+    caused by a page break does NOT discard the still-open INCOME/EXPENSE context.
+    """
+    total_in  = 0.0
+    total_out = 0.0
+    in_income  = False
+    in_expense = False
+    _current_room: str | None = None   # track room number to detect repeats
+
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Room header — only reset section state when the room NUMBER changes.
+        # A repeated header on the same page (page-break artefact) keeps current state.
+        rm = re.match(r'Room\s+(\d+)/.+MONEY\s+OUT\s+MONEY\s+IN', stripped, re.IGNORECASE)
+        if rm:
+            _room_num = rm.group(1)
+            if _room_num != _current_room:
+                in_income = in_expense = False
+                _current_room = _room_num
+            continue   # header line itself carries no amount data
+
+        # Section headers
+        if stripped.upper() == 'INCOME':
+            in_income  = True
+            in_expense = False
+            continue
+        if stripped.upper() == 'EXPENSE':
+            in_expense = True
+            in_income  = False
+            continue
+
+        # BALANCE: or "Ownership Payments" signal end of room data
+        if re.match(r'BALANCE\s*:', stripped, re.IGNORECASE):
+            in_income = in_expense = False
+            continue
+        if re.match(r'Ownership\s+Payments', stripped, re.IGNORECASE):
+            break  # no more room sections after this
+
+        # Standalone "$X.XX" line = section subtotal
+        sm = re.match(r'^\$\s*([\d,]+\.?\d*)$', stripped)
+        if sm:
+            amt = _parse_amount(sm.group(1)) or 0.0
+            if in_income:
+                total_in += amt
+                in_income = False   # one subtotal per income block
+            elif in_expense:
+                total_out += amt
+                in_expense = False  # one subtotal per expense block
+
+    return total_in, total_out
+
+
 # ── Console / Reapit Owner Statement itemized extractor ───────────────────────
 # Parses individual Expense Debit lines from the Console Australia / Reapit
 # ("Harcourts Focus" etc.) Owner Statement format:
@@ -1288,7 +1381,7 @@ def _ailo_bills_from_columns(text: str) -> tuple:
 
 _CONSOLE_EXPENSE_MAP = [
     # Management-related (agency charges kept in trust)
-    (['management fee', 'property management', 'admin fee', 'administration fee',
+    (['management fee', 'management', 'property management', 'admin fee', 'administration fee',
       'inspection fee', 'condition report', 'routine inspection', 'entry condition',
       'national tenancy', 'ntd', 'tenancy database', 'bank charge', 'bank fee',
       'statement fee', 'tribunal', 'ncat', 'vcat', 'wat '],
@@ -1549,6 +1642,17 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
                 if _val is not None and (result[_key] == 0.0 or _key == 'eft'):
                     result[_key] = _val
 
+    # ── Certainty Property old-format: per-room subtotal extraction ──────────
+    # Fills money_in / money_out by summing per-room INCOME and EXPENSE subtotals.
+    # Runs ONLY for the old format (OWNERSHIP STATEMENT #N) where no global
+    # "Money In $X" summary line exists.  EFT is already captured above.
+    if not _is_ailo and result['money_in'] == 0.0 and _is_certainty_old(text):
+        _ci, _co = _extract_certainty_old_totals(text)
+        if _ci > 0.0:
+            result['money_in']  = _ci
+        if _co > 0.0:
+            result['money_out'] = _co
+
     # ── Ailo itemised bill extraction ────────────────────────────────────────
     # Use pdfplumber word x-coordinates to distinguish In column (income items
     # Description-based: income receipts (lease break fees, bond money, etc.)
@@ -1647,7 +1751,7 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
             re.MULTILINE
         )
         _pm_skip = re.compile(
-            r'^(management fee|rent paid|balance brought|gst|total\s+tax|'
+            r'^(management\b|rent paid|balance brought|gst|total\s+tax|'
             r'withdrawal|eft\s+to|disbursement)',
             re.IGNORECASE
         )
@@ -1682,10 +1786,14 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
 
     # ── Tier C: LLM fallback ───────────────────────────────────────────────
     # Trigger only if:
-    #   (a) both regex AND table extraction returned nothing (0 values), AND
+    #   (a) both money_in AND money_out are still 0 after regex + table tiers, AND
     #   (b) the PDF text actually contains financial data worth extracting
     #       (guards against non-rental PDFs and legitimately empty months)
-    if result['money_in'] == 0.0 and result['eft'] == 0.0 and _has_rental_financial_data(text):
+    # NOTE: previously the condition was "money_in==0 AND eft==0", which missed
+    # formats where EFT is captured but income/expense breakdown is missing
+    # (e.g. Certainty old format before the per-room extraction fix).
+    # Using money_out instead of eft makes the trigger more precise.
+    if result['money_in'] == 0.0 and result['money_out'] == 0.0 and _has_rental_financial_data(text):
         _llm = _llm_extract_rental(text)
         _any_llm = False
         for _k in ('money_in', 'money_out', 'eft'):
