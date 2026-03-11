@@ -18,5 +18,10 @@
     "keyword": "offset to loan account",
     "section": "opex",
     "category": "Financing"
+  },
+  {
+    "keyword": "debit interest rates",
+    "section": "opex",
+    "category": "Financing"
   }
 ]
