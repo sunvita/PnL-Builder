@@ -3,5 +3,10 @@
     "keyword": "bank debit",
     "section": "opex",
     "category": "Financing"
+  },
+  {
+    "keyword": "bank debit fee",
+    "section": "opex",
+    "category": "Financing"
   }
 ]
