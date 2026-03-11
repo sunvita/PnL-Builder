@@ -93,7 +93,11 @@ SEMANTIC_TYPE: dict[str, str] = {
     'Land Tax': 'expense', 'Strata / Body Corporate': 'expense',
     'Building Insurance': 'expense', 'Maintenance & Repairs': 'expense',
     'Cleaning': 'expense', 'Advertising': 'expense', 'Miscellaneous': 'expense',
+    'Furnishing Costs': 'expense',
     'Total Operating Expenses': 'expense_tot',
+    # Capital allowances (non-cash)
+    'Depreciation': 'expense',
+    'Total Depreciation': 'expense_tot',
     # Utilities
     'Electricity': 'expense', 'Water': 'expense', 'Gas': 'expense', 'Internet': 'expense',
     'Total Utilities': 'expense_tot',
@@ -141,6 +145,7 @@ PL_STRUCTURE = [
     ('item',    'Cleaning'),
     ('item',    'Advertising'),
     ('item',    'Miscellaneous'),
+    ('item',    'Furnishing Costs'),
     ('total',   'Total Operating Expenses'),
     ('blank',   None),
     ('kpi',     'NOI (Net Operating Income)'),
@@ -159,6 +164,10 @@ PL_STRUCTURE = [
     ('item',    'Bank Service Fee'),
     ('total',   'Total Financing Cost'),
     ('blank',   None),
+    ('section', 'CAPITAL ALLOWANCES'),
+    ('item',    'Depreciation'),
+    ('total',   'Total Depreciation'),
+    ('blank',   None),
     ('kpi',     'NET PROFIT / (LOSS)'),
     ('blank',   None),
     ('section', 'CASH FLOW'),
@@ -175,7 +184,9 @@ LABEL_ROW: dict[str, int] = {}   # filled during build
 INCOME_ITEMS    = ['Rental Income', 'Other Income', 'Excess Bill Shares']
 OPEX_ITEMS      = ['Management Fees', 'Letting Fees', 'Council Rates', 'Land Tax',
                    'Strata / Body Corporate', 'Building Insurance',
-                   'Maintenance & Repairs', 'Cleaning', 'Advertising', 'Miscellaneous']
+                   'Maintenance & Repairs', 'Cleaning', 'Advertising', 'Miscellaneous',
+                   'Furnishing Costs']
+DEPRECIATION_ITEMS = ['Depreciation']
 UTILITY_ITEMS   = ['Electricity', 'Water', 'Gas', 'Internet']
 FINANCING_ITEMS = ['Mortgage Interest', 'Bank Package Fee', 'Bank Service Fee']
 CF_ITEMS        = ['Cash Received (EFT)', 'Less: Utilities Paid',
@@ -461,6 +472,7 @@ def build_workbook(
                                      OPEX_ITEMS if label == 'Total Operating Expenses' else
                                      UTILITY_ITEMS if label == 'Total Utilities' else
                                      FINANCING_ITEMS if label == 'Total Financing Cost' else
+                                     DEPRECIATION_ITEMS if label == 'Total Depreciation' else
                                      CF_ITEMS if label == 'Net Cash Flow' else [])
                         rows_ref = ','.join(
                             f'{col(mc_idx)}{LABEL_ROW[i]}'
@@ -474,14 +486,15 @@ def build_workbook(
                         noi_r = LABEL_ROW.get('NOI (Net Operating Income)')
                         tu_r  = LABEL_ROW.get('Total Utilities')
                         tf_r  = LABEL_ROW.get('Total Financing Cost')
+                        td_r  = LABEL_ROW.get('Total Depreciation')
                         cr    = col(mc_idx)
                         if label == 'NOI (Net Operating Income)':
                             val = f'={cr}{ti}-{cr}{tox}' if ti and tox else None
                         elif label == 'NOI Margin %':
                             val = f'=IFERROR({cr}{noi_r}/{cr}{ti},"-")' if noi_r and ti else None
                         elif label == 'NET PROFIT / (LOSS)':
-                            val = (f'={cr}{noi_r}-{cr}{tu_r}-{cr}{tf_r}'
-                                   if all([noi_r, tu_r, tf_r]) else None)
+                            val = (f'={cr}{noi_r}-{cr}{tu_r}-{cr}{tf_r}-{cr}{td_r}'
+                                   if all([noi_r, tu_r, tf_r, td_r]) else None)
                         else:
                             val = None
                         fc = F(size=9, color=sem_fg or BLACK)
@@ -513,6 +526,7 @@ def build_workbook(
                                  OPEX_ITEMS   if label == 'Total Operating Expenses' else
                                  UTILITY_ITEMS if label == 'Total Utilities' else
                                  FINANCING_ITEMS if label == 'Total Financing Cost' else
+                                 DEPRECIATION_ITEMS if label == 'Total Depreciation' else
                                  CF_ITEMS if label == 'Net Cash Flow' else [])
                     rows_ref = ','.join(
                         f'{cr}{LABEL_ROW[i]}' for i in item_list if i in LABEL_ROW
@@ -524,13 +538,14 @@ def build_workbook(
                     noi_r = LABEL_ROW.get('NOI (Net Operating Income)')
                     tu_r  = LABEL_ROW.get('Total Utilities')
                     tf_r  = LABEL_ROW.get('Total Financing Cost')
+                    td_r  = LABEL_ROW.get('Total Depreciation')
                     if label == 'NOI (Net Operating Income)':
                         ft_val = f'={cr}{ti}-{cr}{tox}' if ti and tox else None
                     elif label == 'NOI Margin %':
                         ft_val = f'=IFERROR({cr}{noi_r}/{cr}{ti},"-")' if noi_r and ti else None
                     elif label == 'NET PROFIT / (LOSS)':
-                        ft_val = (f'={cr}{noi_r}-{cr}{tu_r}-{cr}{tf_r}'
-                                  if all([noi_r, tu_r, tf_r]) else None)
+                        ft_val = (f'={cr}{noi_r}-{cr}{tu_r}-{cr}{tf_r}-{cr}{td_r}'
+                                  if all([noi_r, tu_r, tf_r, td_r]) else None)
                     else:
                         ft_val = None
                 else:
@@ -570,6 +585,7 @@ def build_workbook(
                     noi_r = LABEL_ROW.get('NOI (Net Operating Income)')
                     tu_r  = LABEL_ROW.get('Total Utilities')
                     tf_r  = LABEL_ROW.get('Total Financing Cost')
+                    td_r  = LABEL_ROW.get('Total Depreciation')
                     refs_noi = [f'{col(fy_month_cols[fy][mo])}{noi_r}'
                                 for fy in fy_labels for mo in month_seq
                                 if ((int(fy.split('-')[0]) if mo >= fy_start_month
@@ -582,7 +598,11 @@ def build_workbook(
                                 for fy in fy_labels for mo in month_seq
                                 if ((int(fy.split('-')[0]) if mo >= fy_start_month
                                      else int(fy.split('-')[0]) + 1) == cy) if tf_r]
-                    cy_val = (f'=SUM({",".join(refs_noi)})-SUM({",".join(refs_tu)})-SUM({",".join(refs_tf)})'
+                    refs_td  = [f'{col(fy_month_cols[fy][mo])}{td_r}'
+                                for fy in fy_labels for mo in month_seq
+                                if ((int(fy.split('-')[0]) if mo >= fy_start_month
+                                     else int(fy.split('-')[0]) + 1) == cy) if td_r]
+                    cy_val = (f'=SUM({",".join(refs_noi)})-SUM({",".join(refs_tu)})-SUM({",".join(refs_tf)})-SUM({",".join(refs_td)})'
                               if refs_noi else None)
                 elif rtype == 'kpi' and label == 'NOI Margin %':
                     cy_val = None

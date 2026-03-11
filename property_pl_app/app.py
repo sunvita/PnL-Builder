@@ -201,8 +201,10 @@ def _parse_excel_to_session(xlsx_bytes: bytes) -> tuple[bool, str, dict]:
             'Management Fees', 'Letting Fees', 'Council Rates', 'Land Tax',
             'Strata / Body Corporate', 'Building Insurance',
             'Maintenance & Repairs', 'Cleaning', 'Advertising', 'Miscellaneous',
+            'Furnishing Costs',
             'Electricity', 'Water', 'Gas', 'Internet',
             'Mortgage Interest',
+            'Depreciation',
             'Cash Received (EFT)', 'Less: Utilities Paid',
             'Less: Mortgage Repayment', 'Principal Repaid',
         }
@@ -727,12 +729,12 @@ def _render_upgrade_banner() -> None:
         # ── Pro: navy strip with PRO badge + feature summary ───────────────────
         st.markdown(
             f'<div style="background:#1A237E;'
-            f'color:#FFFFFF;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
+            f'color:#E8EEFF;padding:10px 20px;border-radius:7px;margin-bottom:14px;'
             f'font-size:13px;font-weight:400;display:flex;align-items:center;'
             f'justify-content:space-between;gap:12px;">'
             f'<span>'
             f'<span style="font-weight:700;margin-right:14px;">All features unlocked</span>'
-            f'<span style="opacity:0.7;font-size:12px;">'
+            f'<span style="color:#B0BCEE;font-size:12px;">'
             f'✅ <b>Unlimited properties</b> &nbsp;·&nbsp; '
             f'✅ Full FY history &nbsp;·&nbsp; '
             f'✅ Add Entry &nbsp;·&nbsp; '
