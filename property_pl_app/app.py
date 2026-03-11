@@ -1934,8 +1934,10 @@ elif st.session_state.step == 3:
         'Management Fees', 'Letting Fees',
         'Council Rates', 'Land Tax', 'Strata / Body Corporate', 'Building Insurance',
         'Maintenance & Repairs', 'Cleaning', 'Advertising', 'Miscellaneous',
+        'Furnishing Costs',
         'Electricity', 'Water', 'Gas', 'Internet',
         'Mortgage Interest',
+        'Depreciation',
         'Cash Received (EFT)', 'Less: Utilities Paid',
         'Less: Mortgage Repayment', 'Principal Repaid',
     ]
