@@ -23,5 +23,10 @@
     "keyword": "debit interest rates",
     "section": "opex",
     "category": "Financing"
+  },
+  {
+    "keyword": "opening balance",
+    "section": "opex",
+    "category": "Financing"
   }
 ]
