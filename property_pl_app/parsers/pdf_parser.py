@@ -1593,24 +1593,9 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
         # Generic patterns for other management platforms.
         # Covers PropertyMe / O'Halloran Circuit / Console (NAS agency) / Certainty (PropertyTree) / and learned patterns.
 
-        # ── Step 1: apply any LLM-learned regex rules first ────────────────────
-        for _rule in _learned_regex_rules.get('money_in', []):
-            if result['money_in'] == 0.0:
-                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
-                if _m:
-                    result['money_in'] = _parse_amount(_m.group(1)) or 0.0
-        for _rule in _learned_regex_rules.get('money_out', []):
-            if result['money_out'] == 0.0:
-                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
-                if _m:
-                    result['money_out'] = _parse_amount(_m.group(1)) or 0.0
-        for _rule in _learned_regex_rules.get('eft', []):
-            if result['eft'] == 0.0:
-                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
-                if _m:
-                    result['eft'] = _parse_amount(_m.group(1)) or 0.0
-
-        # ── Step 2: static patterns (all known formats) ────────────────────────
+        # ── Step 1: static patterns (all known formats) — always highest priority ─
+        # Learned rules run AFTER static patterns (Step 2) so that battle-tested
+        # patterns always win; learned rules only fill in what static misses.
         for _label, _key in [
             # PropertyMe / O'Halloran Circuit — use [ \t:]+ to prevent crossing newlines
             # (Certainty/PropertyTree uses "MONEY IN" as a column header with amounts on next line)
@@ -1639,8 +1624,25 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
             _m = re.search(_label, text, re.IGNORECASE | re.MULTILINE)
             if _m:
                 _val = _parse_amount(_m.group(1))
-                if _val is not None and (result[_key] == 0.0 or _key == 'eft'):
+                if _val is not None and result[_key] == 0.0:
                     result[_key] = _val
+
+        # ── Step 2: LLM-learned regex rules — only fill what static missed ────
+        for _rule in _learned_regex_rules.get('money_in', []):
+            if result['money_in'] == 0.0:
+                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
+                if _m:
+                    result['money_in'] = _parse_amount(_m.group(1)) or 0.0
+        for _rule in _learned_regex_rules.get('money_out', []):
+            if result['money_out'] == 0.0:
+                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
+                if _m:
+                    result['money_out'] = _parse_amount(_m.group(1)) or 0.0
+        for _rule in _learned_regex_rules.get('eft', []):
+            if result['eft'] == 0.0:
+                _m = re.search(_rule['pattern'], text, re.IGNORECASE | re.MULTILINE)
+                if _m:
+                    result['eft'] = _parse_amount(_m.group(1)) or 0.0
 
     # ── Certainty Property old-format: per-room subtotal extraction ──────────
     # Fills money_in / money_out by summing per-room INCOME and EXPENSE subtotals.
@@ -1711,8 +1713,11 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
         _pm_room_matches = list(re.finditer(
             r'(room\s*\d+|unit\s*[\w\d]+)\s*/', text, re.IGNORECASE
         ))
+        # No slash-format rooms found; match bare "Room N" / "Unit N" headers.
+        # No need to exclude slash-suffixed matches here — _pm_room_matches
+        # already took the slash path above, so this branch has none.
         _generic_room_matches = list(re.finditer(
-            r'(?<![/\d])(room\s*\d+\b|unit\s*\w+\b)(?![\s]*/)', text, re.IGNORECASE
+            r'(?<![/\d])(room\s*\d+\b|unit\s*\w+\b)', text, re.IGNORECASE
         ))
         _room_candidates = _pm_room_matches if _pm_room_matches else _generic_room_matches
         for _i, _rm_m in enumerate(_room_candidates):
@@ -1741,6 +1746,47 @@ def parse_rental_statement(file_bytes: bytes, filename: str = '') -> dict:
                     'rent': _rent, 'mgmt': _mgmt,
                     'net':  round(_rent - _mgmt, 2),
                 }
+            else:
+                # Co-living PM format (e.g. Wealthstone Property): no "Total $out $in" row per room.
+                # Sum individual date-stamped rent payments ("DD/MM/YY $amount")
+                # and extract "Property Management Fee $amount" per room.
+                _rent_pmts = re.findall(
+                    r'\d{2}/\d{2}/\d{2}\s+\$([\d,]+\.?\d*)',
+                    _segment,
+                )
+                _rent = round(sum(_parse_amount(x) or 0.0 for x in _rent_pmts), 2)
+                _mgmt_m = re.search(
+                    r'Property\s+Management\s+Fee\s+\$([\d,]+\.?\d*)',
+                    _segment, re.IGNORECASE,
+                )
+                _mgmt = (_parse_amount(_mgmt_m.group(1)) or 0.0) if _mgmt_m else 0.0
+                if _rent > 0:
+                    result['rooms'][_rname] = {
+                        'rent': _rent, 'mgmt': _mgmt,
+                        'net':  round(_rent - _mgmt, 2),
+                    }
+
+    # ── Co-living PM format: Maintenance bill items (no * separator) ────────
+    # Format: "Maintenance Description $amount" — extracted before PropertyMe check
+    if not _is_ailo and not result.get('bill_items'):
+        _hc_maint_pat = re.compile(
+            r'^(Maintenance\b[^\n\$]{2,60})\$\s*([\d,]+\.?\d*)',
+            re.MULTILINE | re.IGNORECASE,
+        )
+        _hc_items: list = []
+        _hc_totals: dict = {}
+        for _bm in _hc_maint_pat.finditer(text):
+            _desc = _bm.group(1).strip()
+            _amt  = _parse_amount(_bm.group(2)) or 0.0
+            if _amt <= 0:
+                continue
+            _, _pl_cat = _categorize_by_keywords(_desc)
+            _hc_items.append({'description': _desc, 'category': _pl_cat, 'amount': _amt})
+            _hc_totals[_pl_cat] = round(_hc_totals.get(_pl_cat, 0.0) + _amt, 2)
+        if _hc_items:
+            result['bill_items'] = _hc_items
+            for _cat, _total in _hc_totals.items():
+                result['pl_items'][_cat] = _total
 
     # ── PropertyMe-style bill item extraction ────────────────────────────────
     # PropertyMe bills appear as "description * $amount" lines (not Ailo "·" format).
@@ -1876,10 +1922,7 @@ _CBA_SKIP_RE = re.compile(
     re.IGNORECASE
 )
 
-_CBA_MON = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-}
+# Month abbrev → int mapping reuses module-level MONTH_MAP (see line ~453)
 
 def _parse_cba_home_loan_transactions(text: str) -> list:
     """
@@ -1898,9 +1941,9 @@ def _parse_cba_home_loan_transactions(text: str) -> list:
         text, re.IGNORECASE,
     )
     if p:
-        start_mon = _CBA_MON.get(p.group(1).lower()[:3], 1)
+        start_mon = MONTH_MAP.get(p.group(1).lower()[:3], 1)
         start_yr  = int(p.group(2))
-        end_mon   = _CBA_MON.get(p.group(3).lower()[:3], 12)
+        end_mon   = MONTH_MAP.get(p.group(3).lower()[:3], 12)
         end_yr    = int(p.group(4))
     else:
         yr_m = re.search(r'\b(20\d{2})\b', text)
@@ -1943,7 +1986,7 @@ def _parse_cba_home_loan_transactions(text: str) -> list:
         ):
             continue
 
-        mon_num = _CBA_MON.get(mon_s.lower()[:3])
+        mon_num = MONTH_MAP.get(mon_s.lower()[:3])
         if not mon_num:
             continue
 
@@ -1973,7 +2016,7 @@ def _parse_cba_home_loan_transactions(text: str) -> list:
         text, re.IGNORECASE,
     )
     if snap_m:
-        s_mon = _CBA_MON.get(snap_m.group(1).lower()[:3])
+        s_mon = MONTH_MAP.get(snap_m.group(1).lower()[:3])
         s_yr  = int(snap_m.group(2))
         if s_mon:
             snapshot_date = f'01/{s_mon:02d}/{s_yr}'
@@ -2060,10 +2103,7 @@ _INVOICE_KEYWORDS = frozenset([
     'sinking fund levy', 'capital works levy',
 ])
 
-_NAB_MON = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-}
+# NAB uses module-level MONTH_MAP
 
 # Date-prefixed lines to skip (informational / repayment rows)
 _NAB_DATE_SKIP_RE = re.compile(
@@ -2140,7 +2180,7 @@ def _parse_nab_home_loan_transactions(text: str) -> list:
         dm = DATE_RE.match(line)
         if dm:
             day, mon_s, yr = dm.group(1), dm.group(2), dm.group(3)
-            mon_num = _NAB_MON.get(mon_s.lower()[:3])
+            mon_num = MONTH_MAP.get(mon_s.lower()[:3])
             if mon_num:
                 current_date = f'{int(day):02d}/{mon_num:02d}/{yr}'
             # If the rest of the line describes a Loan Repayment, flag it —
@@ -2248,11 +2288,7 @@ _ANZ_HL_MARKER = re.compile(
     r'ANZ\s+(?:HOME\s+LOAN|RESIDENTIAL\s+INVEST\.?\s*LOAN)\s+STATEMENT',
     re.IGNORECASE,
 )
-_ANZ_MON = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
-    'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
-    'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-}
+# ANZ uses module-level MONTH_MAP
 
 # "DD MON DESCRIPTION debit_amount blank balance DR"
 _ANZ_DEBIT_RE = re.compile(
@@ -2347,7 +2383,7 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
             mon_s = dm.group(2)
             desc  = dm.group(3).strip().upper()
             amt   = abs(_parse_amount(dm.group(4)) or 0.0)
-            mon_num = _ANZ_MON.get(mon_s.lower()[:3])
+            mon_num = MONTH_MAP.get(mon_s.lower()[:3])
             if not mon_num or amt == 0:
                 continue
             key = (current_year, mon_num)
@@ -2365,7 +2401,7 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
             mon_s = cm.group(2)
             desc  = cm.group(3).strip().upper()
             amt   = abs(_parse_amount(cm.group(4)) or 0.0)
-            mon_num = _ANZ_MON.get(mon_s.lower()[:3])
+            mon_num = MONTH_MAP.get(mon_s.lower()[:3])
             if not mon_num or amt == 0:
                 continue
             key = (current_year, mon_num)
@@ -2388,7 +2424,7 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
             mon_s = nb.group(2)
             desc  = nb.group(3).strip().upper()
             amt   = abs(_parse_amount(nb.group(4)) or 0.0)
-            mon_num = _ANZ_MON.get(mon_s.lower()[:3])
+            mon_num = MONTH_MAP.get(mon_s.lower()[:3])
             if not mon_num or amt == 0:
                 continue
             key = (current_year, mon_num)
@@ -2468,6 +2504,265 @@ def _parse_anz_home_loan_transactions(text: str) -> list:
     return transactions
 
 
+# ── Bankwest Complete Variable Home Loan ─────────────────────────────────────
+_BANKWEST_HL_MARKER = re.compile(
+    r'COMPLETE\s+VARIABLE\s+HOME\s+LOAN\s+STATEMENT',
+    re.IGNORECASE,
+)
+# Bankwest uses module-level MONTH_MAP
+# "DD MMM YY DEBIT INTEREST AFTER OFFSET SAVING OF $X.XX"
+_BW_INTEREST_RE = re.compile(
+    r'^(\d{2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{2})\s+'
+    r'DEBIT\s+INTEREST\s+AFTER\s+OFFSET\s+SAVING\s+OF\s+\$([\d,]+\.?\d*)',
+    re.IGNORECASE,
+)
+# "DD MMM YY COMPLETE PACKAGE FEE $X.XX"
+_BW_FEE_RE = re.compile(
+    r'^(\d{2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{2})\s+'
+    r'COMPLETE\s+PACKAGE\s+FEE\s+\$([\d,]+\.?\d*)',
+    re.IGNORECASE,
+)
+# "DD MMM YY CREDIT TRANSFER FROM ... $X.XX $BALANCE DR"
+_BW_REPAY_RE = re.compile(
+    r'^(\d{2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{2})\s+'
+    r'CREDIT\s+TRANSFER\s+FROM\s+.+?\s+\$([\d,]+\.?\d*)\s+\$[\d,]+\.?\d*DR',
+    re.IGNORECASE,
+)
+
+
+def _parse_bankwest_home_loan_transactions(text: str) -> list:
+    """
+    Parse Bankwest Complete Variable Home Loan statements.
+
+    Two-line interest format (pdfplumber word-wrap):
+      Line 1: "DD MMM YY DEBIT INTEREST AFTER OFFSET SAVING OF $X"  ← X = net interest charged
+      Line 2: "$Y $BALANCE DR"  (Y = gross interest without offset, informational)
+
+    Captures per calendar month:
+      Mortgage Interest  ← DEBIT INTEREST AFTER OFFSET SAVING OF $X
+      Bank Fees          ← COMPLETE PACKAGE FEE $X
+      Less: Mortgage Repayment ← CREDIT TRANSFER FROM ... $X
+    """
+    monthly: dict = {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        m = _BW_INTEREST_RE.match(line)
+        if m:
+            mon_num = MONTH_MAP.get(m.group(2).lower()[:3])
+            if not mon_num:
+                continue
+            year = 2000 + int(m.group(3))
+            key  = (year, mon_num)
+            monthly.setdefault(key, {'interest': 0.0, 'repayment': 0.0, 'fees': 0.0})
+            amt = _parse_amount(m.group(4)) or 0.0
+            monthly[key]['interest'] = round(monthly[key]['interest'] + amt, 2)
+            continue
+
+        m = _BW_FEE_RE.match(line)
+        if m:
+            mon_num = MONTH_MAP.get(m.group(2).lower()[:3])
+            if not mon_num:
+                continue
+            year = 2000 + int(m.group(3))
+            key  = (year, mon_num)
+            monthly.setdefault(key, {'interest': 0.0, 'repayment': 0.0, 'fees': 0.0})
+            amt = _parse_amount(m.group(4)) or 0.0
+            monthly[key]['fees'] = round(monthly[key]['fees'] + amt, 2)
+            continue
+
+        m = _BW_REPAY_RE.match(line)
+        if m:
+            mon_num = MONTH_MAP.get(m.group(2).lower()[:3])
+            if not mon_num:
+                continue
+            year = 2000 + int(m.group(3))
+            key  = (year, mon_num)
+            monthly.setdefault(key, {'interest': 0.0, 'repayment': 0.0, 'fees': 0.0})
+            amt = _parse_amount(m.group(4)) or 0.0
+            monthly[key]['repayment'] = round(monthly[key]['repayment'] + amt, 2)
+
+    transactions = []
+    for (yr, mon), data in sorted(monthly.items()):
+        interest  = round(data['interest'], 2)
+        repayment = round(data['repayment'], 2)
+        fees      = round(data['fees'], 2)
+        if interest == 0 and repayment == 0 and fees == 0:
+            continue
+        date_str = f'01/{mon:02d}/{yr}'
+        if interest > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Interest (after offset saving)',
+                'amount':      interest,
+                'type':        'debit',
+                'section':     'financing',
+                'category':    'Mortgage Interest',
+            })
+        if fees > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Package Fee',
+                'amount':      fees,
+                'type':        'debit',
+                'section':     'financing',
+                'category':    'Bank Fees',
+            })
+        if repayment > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Loan Repayment',
+                'amount':      repayment,
+                'type':        'debit',
+                'section':     'cashflow',
+                'category':    'Less: Mortgage Repayment',
+            })
+            # Principal = repayment − interest (positive when extra principal repaid)
+            principal = round(repayment - interest, 2)
+            if principal > 0:
+                transactions.append({
+                    'date':        date_str,
+                    'description': 'Principal Repaid',
+                    'amount':      principal,
+                    'type':        'credit',
+                    'section':     'cashflow',
+                    'category':    'Principal Repaid',
+                })
+    return transactions
+
+
+# ── Macquarie Offset Home Loan ────────────────────────────────────────────────
+_MQ_HL_MARKER = re.compile(
+    r'Offset\s+Home\s+Loan\s+Transaction\s+Listing\s+Report',
+    re.IGNORECASE,
+)
+# MQ uses module-level MONTH_MAP
+# Month header line: "Sep 2025", "Oct 2025", etc.
+_MQ_MONTH_HDR_RE = re.compile(
+    r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s*$',
+    re.IGNORECASE,
+)
+# Transaction line: "Mon DD description amount balance [DR]"
+# Captures debit (balance DR) and credit (balance DR after repayment) lines.
+_MQ_TX_RE = re.compile(
+    r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+'
+    r'(.+?)\s+([\d,]+\.\d{2})\s+[\d,]+\.\d{2}(?:\s+DR)?$',
+    re.IGNORECASE,
+)
+
+
+def _parse_mq_home_loan_transactions(text: str) -> list:
+    """
+    Parse Macquarie Offset Home Loan Transaction Listing Reports.
+
+    Format: month-header rows ("Sep 2025") followed by transaction lines:
+      "Mon DD  Description  debit_amount  balance DR"
+      No $ signs, no explicit Debit/Credit column separation.
+
+    Captures per calendar month:
+      Mortgage Interest        ← "Interest charged"
+      Bank Fees                ← "Package fee" / "Annual fee"
+      Less: Mortgage Repayment ← "from account XXXXXX amount"  (credit / cashflow)
+      Principal Repaid         ← repayment − interest (cashflow)
+    Skips: "Loan drawdown", "Documentation fee", "Opening balance", "Closing balance".
+    """
+    monthly: dict = {}
+    current_year: int | None = None
+    in_tx = False
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Detect start of transaction section
+        if re.search(r'Your\s+transactions', line, re.IGNORECASE):
+            in_tx = True
+            continue
+        if not in_tx:
+            continue
+
+        # Month header "Sep 2025"
+        mh = _MQ_MONTH_HDR_RE.match(line)
+        if mh:
+            current_year = int(mh.group(2))
+            continue
+
+        if current_year is None:
+            continue
+
+        # Transaction line
+        m = _MQ_TX_RE.match(line)
+        if not m:
+            continue
+        mon_num = MONTH_MAP.get(m.group(1).lower()[:3])
+        desc    = m.group(3).strip().lower()
+        amt     = _parse_amount(m.group(4)) or 0.0
+        if not mon_num or amt == 0:
+            continue
+        key = (current_year, mon_num)
+        monthly.setdefault(key, {'interest': 0.0, 'fees': 0.0, 'repayment': 0.0})
+
+        if 'interest charged' in desc:
+            monthly[key]['interest'] = round(monthly[key]['interest'] + amt, 2)
+        elif 'package fee' in desc or 'annual fee' in desc:
+            monthly[key]['fees'] = round(monthly[key]['fees'] + amt, 2)
+        elif desc.startswith('from account'):
+            # Offset account repayment credit (covers interest + reduces principal)
+            monthly[key]['repayment'] = round(monthly[key]['repayment'] + amt, 2)
+        # "loan drawdown", "documentation fee" → skip
+
+    transactions = []
+    for (yr, mon), data in sorted(monthly.items()):
+        interest  = round(data['interest'], 2)
+        fees      = round(data['fees'], 2)
+        repayment = round(data['repayment'], 2)
+        if interest == 0 and fees == 0 and repayment == 0:
+            continue
+        date_str = f'01/{mon:02d}/{yr}'
+        if interest > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Interest charged',
+                'amount':      interest,
+                'type':        'debit',
+                'section':     'financing',
+                'category':    'Mortgage Interest',
+            })
+        if fees > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Package Fee',
+                'amount':      fees,
+                'type':        'debit',
+                'section':     'financing',
+                'category':    'Bank Fees',
+            })
+        if repayment > 0:
+            transactions.append({
+                'date':        date_str,
+                'description': 'Loan Repayment (from offset account)',
+                'amount':      repayment,
+                'type':        'debit',
+                'section':     'cashflow',
+                'category':    'Less: Mortgage Repayment',
+            })
+            principal = round(repayment - interest, 2)
+            if principal > 0:
+                transactions.append({
+                    'date':        date_str,
+                    'description': 'Principal Repaid',
+                    'amount':      principal,
+                    'type':        'credit',
+                    'section':     'cashflow',
+                    'category':    'Principal Repaid',
+                })
+    return transactions
+
+
 # ── 2. BANK TRANSACTION STATEMENT ────────────────────────────────────────────
 def parse_bank_statement(file_bytes: bytes, filename: str = '') -> dict:
     text = _extract_text(file_bytes)
@@ -2542,7 +2837,7 @@ def parse_bank_statement(file_bytes: bytes, filename: str = '') -> dict:
         _nab_acct_m = re.search(r'Account\s+number\s+([\d\-]+)', text, re.IGNORECASE)
         _nab_stmt_m = re.search(r'Statement\s+number\s+(\d+)', text, re.IGNORECASE)
         if _nab_acct_m:
-            result['account_number']   = _nab_acct_m.group(1).strip()
+            result['account_number']   = re.sub(r'[\s\-]+', '', _nab_acct_m.group(1)).strip()
         if _nab_stmt_m:
             result['statement_number'] = _nab_stmt_m.group(1).strip()
         return result
@@ -2570,11 +2865,56 @@ def parse_bank_statement(file_bytes: bytes, filename: str = '') -> dict:
         _acct_m  = re.search(r'Account number\s+([\d\-]+)', text, re.IGNORECASE)
         _stmt_m  = re.search(r'STATEMENT NUMBER\s+(\d+)',   text, re.IGNORECASE)
         if _acct_m:
-            result['account_number']   = _acct_m.group(1).strip()
+            result['account_number']   = re.sub(r'[\s\-]+', '', _acct_m.group(1)).strip()
         if _stmt_m:
             result['statement_number'] = _stmt_m.group(1).strip()
         return result
     # ── End ANZ Home Loan fast-path ───────────────────────────────────────────
+
+    # ── Bankwest Complete Variable Home Loan ─────────────────────────────────
+    if _BANKWEST_HL_MARKER.search(text):
+        transactions = _parse_bankwest_home_loan_transactions(text)
+        result['transactions'] = transactions
+        cat_totals_bw: dict = {}
+        for tx in transactions:
+            sec, cat = tx['section'], tx['category']
+            amt = tx['amount'] if tx['type'] == 'credit' else -tx['amount']
+            cat_totals_bw.setdefault(sec, {}).setdefault(cat, 0.0)
+            cat_totals_bw[sec][cat] = round(cat_totals_bw[sec][cat] + amt, 2)
+        result['categorized'] = cat_totals_bw
+        result['llm_count']   = 0
+        _bw_acct_m = re.search(r'Account\s+Number\s+([\d\-]+)', text, re.IGNORECASE)
+        _bw_stmt_m = re.search(r'Statement\s+Number\s+(\d+)',   text, re.IGNORECASE)
+        _bw_per_m  = re.search(r'Period\s+(.+?)(?:\n|$)',       text, re.IGNORECASE)
+        if _bw_acct_m:
+            result['account_number']   = re.sub(r'[\s\-]+', '', _bw_acct_m.group(1)).strip()
+        if _bw_stmt_m:
+            result['statement_number'] = _bw_stmt_m.group(1).strip()
+        elif _bw_per_m:
+            result['statement_number'] = _bw_per_m.group(1).strip()
+        return result
+    # ── End Bankwest Home Loan fast-path ─────────────────────────────────────
+
+    # ── Macquarie Offset Home Loan ────────────────────────────────────────────
+    if _MQ_HL_MARKER.search(text):
+        transactions = _parse_mq_home_loan_transactions(text)
+        result['transactions'] = transactions
+        cat_totals_mq: dict = {}
+        for tx in transactions:
+            sec, cat = tx['section'], tx['category']
+            amt = tx['amount'] if tx['type'] == 'credit' else -tx['amount']
+            cat_totals_mq.setdefault(sec, {}).setdefault(cat, 0.0)
+            cat_totals_mq[sec][cat] = round(cat_totals_mq[sec][cat] + amt, 2)
+        result['categorized'] = cat_totals_mq
+        result['llm_count']   = 0
+        _mq_acct_m = re.search(r'(\d{6})\s+(\d+)\s+', text)   # BSB + account no
+        _mq_per_m  = re.search(r'From\s+(.+?)\s+to\s+(.+?)(?:\n|$)', text, re.IGNORECASE)
+        if _mq_acct_m:
+            result['account_number'] = _mq_acct_m.group(2).strip()
+        if _mq_per_m:
+            result['statement_number'] = f"{_mq_per_m.group(1).strip()} – {_mq_per_m.group(2).strip()}"
+        return result
+    # ── End Macquarie Home Loan fast-path ────────────────────────────────────
 
     transactions = []
 
@@ -3049,9 +3389,37 @@ def parse_utility_bill(file_bytes: bytes, filename: str = '') -> dict:
         'amount': 0.0, 'raw_text': text[:1000],
     }
 
-    ym = _detect_year_month(text)
-    if ym:
-        result['year'], result['month'] = ym
+    # ── Utility-specific date extraction (higher priority than generic) ──────
+    # Priority 1: "Bill period:" or "Supply period:" — use END date of range
+    _ym_found = False
+    _bp = re.search(
+        r'(?:bill|supply)\s+period[:\s]+\d{1,2}[^\d\n]{0,15}[-–—]\s*(\d{1,2})\s+'
+        r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})',
+        text, re.IGNORECASE,
+    )
+    if _bp:
+        _bm = MONTH_MAP.get(_bp.group(2).lower()[:3])
+        if _bm:
+            result['year'], result['month'] = int(_bp.group(3)), _bm
+            _ym_found = True
+    # Priority 2: "Date of issue DD Mon YYYY" (space-separated, e.g. Synergy)
+    if not _ym_found:
+        _di = re.search(
+            r'date\s+of\s+issue\s+(\d{1,2})\s+'
+            r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{4})',
+            text, re.IGNORECASE,
+        )
+        if _di:
+            _dm = MONTH_MAP.get(_di.group(2).lower()[:3])
+            if _dm:
+                result['year'], result['month'] = int(_di.group(3)), _dm
+                _ym_found = True
+    # Priority 3: generic fallback — strip "Next scheduled read date" noise first
+    if not _ym_found:
+        _clean = re.sub(r'next\s+scheduled\s+read\s+date[^\n]*', '', text, flags=re.IGNORECASE)
+        ym = _detect_year_month(_clean)
+        if ym:
+            result['year'], result['month'] = ym
 
     # ── Detect utility type — most specific signals first ────────────────────
     if any(k in text_lower for k in [
